@@ -1,7 +1,12 @@
 FROM node:24-bookworm-slim AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm config set registry https://registry.npmjs.org/ \
+    && npm config set audit false \
+    && npm config set fund false \
+    && npm config set fetch-retries 3 \
+    && npm config set fetch-timeout 120000 \
+    && npm ci --no-audit --no-fund --loglevel=info
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
