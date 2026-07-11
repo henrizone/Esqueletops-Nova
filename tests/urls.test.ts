@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractUrls, isAllowedMediaUrl, isAutoMediaUrl, mediaCacheKey, normalizeUrl } from "../src/services/media/urls.js";
+import { canonicalYouTubeUrl, extractUrls, isAllowedMediaUrl, isAutoMediaUrl, mediaCacheKey, normalizeUrl } from "../src/services/media/urls.js";
 
 describe("media URLs", () => {
   it("extrai links e remove pontuação final", () => {
@@ -14,8 +14,13 @@ describe("media URLs", () => {
     expect(mediaCacheKey("https://youtu.be/abc?si=123", "video")).toBe(mediaCacheKey("https://youtu.be/abc", "video"));
   });
   it("replica o detector do SmudgeLord para YouTube", () => {
-    expect(isAutoMediaUrl("https://www.youtube.com/shorts/abc123")).toBe(true);
-    expect(isAutoMediaUrl("https://www.youtube.com/watch?v=abc123")).toBe(false);
-    expect(isAutoMediaUrl("https://youtu.be/abc123")).toBe(false);
+    expect(isAutoMediaUrl("https://www.youtube.com/shorts/PNIaxNlyltY")).toBe(true);
+    expect(isAutoMediaUrl("https://www.youtube.com/watch?v=PNIaxNlyltY")).toBe(false);
+    expect(isAutoMediaUrl("https://youtu.be/PNIaxNlyltY")).toBe(false);
+  });
+  it("normaliza links válidos do YouTube antes do yt-dlp", () => {
+    expect(canonicalYouTubeUrl("https://youtu.be/PNIaxNlyltY?si=abc")).toBe("https://www.youtube.com/watch?v=PNIaxNlyltY");
+    expect(canonicalYouTubeUrl("https://www.youtube.com/shorts/PNIaxNlyltY")).toBe("https://www.youtube.com/watch?v=PNIaxNlyltY");
+    expect(() => canonicalYouTubeUrl("https://youtu.be/PNIaxNlytY")).toThrow("incompleto");
   });
 });

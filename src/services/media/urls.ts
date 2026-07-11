@@ -61,6 +61,25 @@ export function isYouTubeUrl(raw: string) {
   }
 }
 
+
+export function canonicalYouTubeUrl(raw: string) {
+  const url = new URL(raw);
+  const host = url.hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
+  let id = "";
+  if (host === "youtu.be") id = url.pathname.split("/").filter(Boolean)[0] ?? "";
+  else if (host === "youtube.com") {
+    if (url.pathname === "/watch") id = url.searchParams.get("v") ?? "";
+    else {
+      const match = url.pathname.match(/^\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{11})(?:\/|$)/i);
+      id = match?.[1] ?? "";
+    }
+  }
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+    throw new Error("Link do YouTube inválido ou incompleto");
+  }
+  return `https://www.youtube.com/watch?v=${id}`;
+}
+
 export function isYouTubeShortsUrl(raw: string) {
   try {
     const url = new URL(raw);

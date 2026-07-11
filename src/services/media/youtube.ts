@@ -13,6 +13,7 @@ import { escapeHtml } from "../../utils/html.js";
 import { sourceKeyboard } from "./source-button.js";
 import { prepareMediaFiles } from "./convert.js";
 import { cookieFileForUrl } from "./cookies.js";
+import { canonicalYouTubeUrl } from "./urls.js";
 
 export type YouTubeDownloadMode = "video" | "audio";
 
@@ -41,24 +42,6 @@ export interface YouTubeInfo {
   formats?: YouTubeFormat[];
 }
 
-interface HelperFormat {
-  itag: number;
-  size: number;
-  width?: number;
-  height?: number;
-  quality_label?: string;
-}
-
-interface HelperInfo {
-  id: string;
-  title: string;
-  author: string;
-  duration_seconds: number;
-  thumbnail?: string;
-  video?: HelperFormat;
-  audio?: HelperFormat;
-}
-
 interface YouTubeCache {
   fileId: string;
   mode: YouTubeDownloadMode;
@@ -67,81 +50,35 @@ interface YouTubeCache {
   caption: string;
 }
 
-async function commonArgs(url: string) {
+async function commonArgs(url: string, includeCookies = false) {
   const args = [
     "--no-warnings",
     "--no-progress",
     "--newline",
     "--no-playlist",
     "--retries", "3",
+    "--extractor-retries", "3",
     "--fragment-retries", "3",
     "--socket-timeout", "20",
     "--no-check-certificates",
-    "--js-runtimes", "node",
+    "--js-runtimes", "deno",
+    "--extractor-args", "youtube:player_client=android_vr,default",
   ];
-  const cookies = await cookieFileForUrl(url);
-  if (cookies) args.push("--cookies", cookies);
+  if (includeCookies) {
+    const cookies = await cookieFileForUrl(url);
+    if (cookies) args.push("--cookies", cookies);
+  }
   if (env.YTDLP_PROXY) args.push("--proxy", env.YTDLP_PROXY);
   return args;
 }
 
-async function helperArgs(url: string) {
-  const args = ["--url", url, "--max-bytes", String(env.MAX_UPLOAD_BYTES)];
-  const cookies = await cookieFileForUrl(url);
-  if (cookies) args.push("--cookies", cookies);
-  return args;
-}
-
-function helperToInfo(info: HelperInfo): YouTubeInfo {
-  const formats: YouTubeFormat[] = [];
-  if (info.video) {
-    formats.push({
-      format_id: String(info.video.itag),
-      ext: "mp4",
-      vcodec: "h264",
-      acodec: "none",
-      width: info.video.width,
-      height: info.video.height,
-      filesize: info.video.size,
-    });
-  }
-  if (info.audio) {
-    formats.push({
-      format_id: String(info.audio.itag),
-      ext: "m4a",
-      vcodec: "none",
-      acodec: "aac",
-      filesize: info.audio.size,
-    });
-  }
-  return {
-    id: info.id,
-    title: info.title,
-    uploader: info.author,
-    channel: info.author,
-    duration: info.duration_seconds,
-    webpage_url: `https://www.youtube.com/watch?v=${info.id}`,
-    thumbnail: info.thumbnail,
-    formats,
-  };
-}
-
-async function probeWithHelper(url: string): Promise<YouTubeInfo> {
-  const result = await execa(env.YOUTUBE_HELPER_BINARY, ["info", ...await helperArgs(url)], {
-    timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 60_000),
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  const info = helperToInfo(JSON.parse(result.stdout) as HelperInfo);
-  if (!info.id || !info.title) throw new Error("O YouTube não retornou os dados do vídeo");
-  return info;
-}
-
-async function probeWithYtDlp(url: string): Promise<YouTubeInfo> {
+async function probeWithYtDlp(url: string, includeCookies = false): Promise<YouTubeInfo> {
+  const canonicalUrl = canonicalYouTubeUrl(url);
   const result = await execa(env.YTDLP_BINARY, [
-    ...await commonArgs(url),
+    ...await commonArgs(canonicalUrl, includeCookies),
     "--dump-single-json",
     "--skip-download",
-    url,
+    canonicalUrl,
   ], {
     timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 60_000),
     maxBuffer: 30 * 1024 * 1024,
@@ -153,10 +90,12 @@ async function probeWithYtDlp(url: string): Promise<YouTubeInfo> {
 
 export async function probeYouTube(url: string): Promise<YouTubeInfo> {
   try {
-    return await probeWithHelper(url);
-  } catch (helperError) {
-    logger.warn({ error: helperError, url }, "Cliente direto do YouTube indisponível; tentando yt-dlp");
-    return probeWithYtDlp(url);
+    return await probeWithYtDlp(url, false);
+  } catch (anonymousError) {
+    const cookies = await cookieFileForUrl(url);
+    if (!cookies) throw anonymousError;
+    logger.warn({ url }, "YouTube anônimo falhou; tentando a sessão configurada");
+    return probeWithYtDlp(url, true);
   }
 }
 
@@ -243,7 +182,7 @@ async function makeThumbnailFromUrl(url?: string) {
 }
 
 function cacheKey(id: string, mode: YouTubeDownloadMode) {
-  return `youtube:v3:${id}:${mode}`;
+  return `youtube:v4:${id}:${mode}`;
 }
 
 function captionFor(info: YouTubeInfo) {
@@ -277,33 +216,12 @@ async function sendCached(
   return ctx.replyWithVideo(cached.fileId, { ...common, supports_streaming: true });
 }
 
-async function downloadWithHelper(url: string, mode: YouTubeDownloadMode, info: YouTubeInfo) {
-  const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-youtube-direct-"));
-  const mediaPath = join(directory, mode === "audio" ? `${info.id}.m4a` : `${info.id}.mp4`);
-  try {
-    const result = await execa(env.YOUTUBE_HELPER_BINARY, [
-      "download",
-      ...await helperArgs(url),
-      "--mode", mode,
-      "--output", mediaPath,
-    ], {
-      timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000,
-      maxBuffer: 20 * 1024 * 1024,
-    });
-    const downloadedInfo = helperToInfo(JSON.parse(result.stdout) as HelperInfo);
-    const thumbnailPath = await makeThumbnailFromUrl(downloadedInfo.thumbnail ?? info.thumbnail);
-    return { directory, mediaPath, thumbnailPath, info: downloadedInfo };
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode) {
+async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode, includeCookies = false) {
+  const canonicalUrl = canonicalYouTubeUrl(url);
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-youtube-"));
   const outputTemplate = join(directory, "%(id)s-%(title).80B.%(ext)s");
   const args = [
-    ...await commonArgs(url),
+    ...await commonArgs(canonicalUrl, includeCookies),
     "--restrict-filenames",
     "--trim-filenames", "120",
     "--output", outputTemplate,
@@ -325,7 +243,7 @@ async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode) {
       "--merge-output-format", "mp4",
     );
   }
-  args.push(url);
+  args.push(canonicalUrl);
 
   try {
     await execa(env.YTDLP_BINARY, args, {
@@ -336,7 +254,7 @@ async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode) {
     const infoPath = files.find((path) => path.endsWith(".info.json"));
     const info = infoPath
       ? JSON.parse(await readFile(infoPath, "utf8")) as YouTubeInfo
-      : await probeWithYtDlp(url);
+      : await probeWithYtDlp(canonicalUrl, includeCookies);
     const mediaExtensions = mode === "audio"
       ? new Set([".mp3", ".m4a", ".aac", ".ogg", ".opus"])
       : new Set([".mp4", ".mkv", ".webm", ".mov", ".m4v"]);
@@ -351,12 +269,14 @@ async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode) {
   }
 }
 
-async function downloadFile(url: string, mode: YouTubeDownloadMode, info: YouTubeInfo) {
+async function downloadFile(url: string, mode: YouTubeDownloadMode, _info: YouTubeInfo) {
   try {
-    return await downloadWithHelper(url, mode, info);
-  } catch (helperError) {
-    logger.warn({ error: helperError, url, mode }, "Download direto do YouTube falhou; tentando yt-dlp");
-    return downloadWithYtDlp(url, mode);
+    return await downloadWithYtDlp(url, mode, false);
+  } catch (anonymousError) {
+    const cookies = await cookieFileForUrl(url);
+    if (!cookies) throw anonymousError;
+    logger.warn({ url, mode }, "Download anônimo do YouTube falhou; tentando a sessão configurada");
+    return downloadWithYtDlp(url, mode, true);
   }
 }
 
