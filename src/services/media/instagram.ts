@@ -249,7 +249,15 @@ export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[]
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
   for (const child of nodes) {
-    const video = Boolean(child.is_video || child.video_url || /Video/i.test(child.__typename ?? ""));
+    // Mesma prioridade do switch em processMedia() do Smudge: __typename
+    // primeiro (GraphVideo/GraphImage/Sidecar), heurísticas como
+    // fallback apenas quando o typename não veio preenchido.
+    const typename = child.__typename ?? "";
+    const video = /Video/i.test(typename)
+      ? true
+      : /Image/i.test(typename)
+        ? false
+        : Boolean(child.is_video || child.video_url);
     const url = (video ? child.video_url : bestImage(child))
       ?.replace(/\\u0026/gi, "&")
       .replace(/&amp;/gi, "&");

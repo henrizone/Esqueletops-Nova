@@ -108,8 +108,15 @@ function videoFormats(entry: Info) {
 export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
+  const imageExt = /^(?:jpe?g|png|webp|gif|heic)$/i;
   for (const entry of flattenEntries(info)) {
-    const formats = videoFormats(entry);
+    // Alguns posts de foto do Instagram fazem o yt-dlp devolver um "formats"
+    // com vcodec preenchido mesmo sem haver vídeo de fato (ex.: preview
+    // sintético gerado pela Meta). Se o próprio yt-dlp já classificou a
+    // extensão do item como imagem, confiamos nisso antes de tratar como
+    // vídeo — mesma prioridade de __typename usada no extrator direto.
+    const isDeclaredImage = imageExt.test(entry.ext ?? "");
+    const formats = isDeclaredImage ? [] : videoFormats(entry);
     if (formats.length) {
       const urls = formats.map((format) => format.url!).filter((url, index, all) => all.indexOf(url) === index);
       const url = urls.shift();
