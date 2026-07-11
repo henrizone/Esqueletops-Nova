@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+coverage/
+*.log
+.tmp/
+tmp/
+cookies.txt
