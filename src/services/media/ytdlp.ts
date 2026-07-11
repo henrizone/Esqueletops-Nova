@@ -4,7 +4,7 @@ import { basename, extname, join } from "node:path";
 import { execa } from "execa";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
-import type { DownloadMode, MediaMetadata } from "./types.js";
+import type { DownloadedMedia, DownloadMode, MediaMetadata } from "./types.js";
 import { downloadWithGalleryDl } from "./gallerydl.js";
 import { downloadInstagramMedia, isInstagramPostUrl } from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
@@ -94,7 +94,7 @@ async function walk(root: string): Promise<string[]> {
   return output;
 }
 
-async function downloadWithYtDlp(url: string, mode: DownloadMode) {
+async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<DownloadedMedia> {
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-media-"));
   try {
     const template = join(directory, "%(playlist_index|)s%(id)s-%(title).80B.%(ext)s");
@@ -148,7 +148,7 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode) {
   }
 }
 
-export async function downloadMedia(url: string, mode: DownloadMode) {
+export async function downloadMedia(url: string, mode: DownloadMode): Promise<DownloadedMedia> {
   if (mode !== "audio" && isTwitterStatusUrl(url)) {
     // O extrator dedicado seleciona somente as mídias do tweet principal e
     // mantém o tweet citado apenas como texto. O yt-dlp não garante isso.

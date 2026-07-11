@@ -1,4 +1,5 @@
 import { InlineKeyboard } from "grammy";
+import { escapeHtml } from "../../utils/html.js";
 
 const serviceLabels: Array<[string, string]> = [
   ["instagram.com", "Abrir no Instagram"],
@@ -36,5 +37,19 @@ export function sourceKeyboard(rawUrl: string): InlineKeyboard | undefined {
     return new InlineKeyboard().url(sourceButtonLabel(url.toString()), url.toString());
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Álbuns do Telegram não suportam teclado inline. O SmudgeLord resolve isso
+ * colocando o acesso à publicação como link clicável na própria legenda.
+ */
+export function sourceCaptionLink(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+    return `<a href="${escapeHtml(url.toString())}">🔗 ${escapeHtml(sourceButtonLabel(url.toString()))}</a>`;
+  } catch {
+    return "";
   }
 }

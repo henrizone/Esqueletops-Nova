@@ -22,6 +22,22 @@ export interface PreparedMediaItem {
   size: number;
 }
 
+/**
+ * Mídia pública que pode ser transmitida diretamente ao Telegram pelo grammY,
+ * sem salvar em disco e sem passar pelo FFmpeg no caminho normal.
+ */
+export interface RemoteMediaItem {
+  url: string;
+  kind: "photo" | "video";
+  filename?: string;
+  thumbnailUrl?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  /** Alternativas da mesma mídia, da melhor compatível para a menor. */
+  fallbackUrls?: string[];
+}
+
 export interface CachedMediaItem {
   kind: MediaKind;
   fileId: string;
@@ -48,7 +64,8 @@ export interface DownloadRequest {
 }
 
 export interface DownloadedMedia {
-  directory: string;
+  directory?: string;
   files: string[];
+  remoteItems?: RemoteMediaItem[];
   metadata: MediaMetadata;
 }

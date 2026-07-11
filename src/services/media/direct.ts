@@ -6,6 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import sanitizeFilename from "sanitize-filename";
 import { env } from "../../config/env.js";
+import type { RemoteMediaItem } from "./types.js";
 
 const MIME_EXTENSIONS: Record<string, string> = {
   "image/jpeg": ".jpg",
@@ -83,4 +84,41 @@ export async function downloadDirectFile(input: {
 
 export async function cleanupDirectory(directory: string) {
   await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+}
+
+/**
+ * Fallback para CDNs que não aceitam streaming direto pelo Telegram. Só é
+ * usado depois que o caminho rápido falha.
+ */
+export async function materializeRemoteItems(
+  items: RemoteMediaItem[],
+  sourceUrl: string,
+): Promise<{ directory: string; files: string[] }> {
+  const directory = await createMediaTempDirectory("esqueletops-nova-remote-");
+  try {
+    const files = await Promise.all(items.map(async (item, index) => {
+      const urls = [item.url, ...(item.fallbackUrls ?? [])]
+        .filter((url, position, all) => all.indexOf(url) === position);
+      let lastError: unknown;
+      for (const url of urls) {
+        try {
+          return await downloadDirectFile({
+            url,
+            directory,
+            index,
+            basename: `media-${index + 1}`,
+            fallbackExtension: item.kind === "video" ? ".mp4" : ".jpg",
+            referer: sourceUrl,
+          });
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError ?? new Error("Não foi possível baixar a mídia remota");
+    }));
+    return { directory, files };
+  } catch (error) {
+    await cleanupDirectory(directory);
+    throw error;
+  }
 }

@@ -17,11 +17,7 @@ describe("álbuns de mídia", () => {
         video: { file_id: "video-file" },
       },
     ]);
-    const editMessageReplyMarkup = vi.fn().mockResolvedValue(true);
-    const ctx = {
-      replyWithMediaGroup,
-      api: { editMessageReplyMarkup },
-    } as unknown as BotContext;
+    const ctx = { replyWithMediaGroup } as unknown as BotContext;
 
     const cached = await sendPreparedMedia(ctx, [
       { path: "/tmp/photo.jpg", kind: "photo", filename: "photo.jpg", size: 10 },
@@ -29,10 +25,9 @@ describe("álbuns de mídia", () => {
     ], "Legenda", 99, "https://x.com/test/status/1");
 
     expect(replyWithMediaGroup).toHaveBeenCalledTimes(1);
-    expect(editMessageReplyMarkup).toHaveBeenCalledTimes(1);
-    expect(editMessageReplyMarkup).toHaveBeenCalledWith(123, 102, expect.objectContaining({
-      reply_markup: expect.anything(),
-    }));
+    const group = replyWithMediaGroup.mock.calls[0]![0] as Array<{ caption?: string }>;
+    expect(group[0]?.caption).toContain("Legenda");
+    expect(group[0]?.caption).toContain("Abrir no Twitter/X");
     expect(cached).toEqual([
       { kind: "photo", fileId: "photo-file", filename: "photo.jpg" },
       { kind: "video", fileId: "video-file", filename: "video.mp4" },
