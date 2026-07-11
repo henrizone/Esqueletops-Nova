@@ -112,7 +112,7 @@ async function fetchTweet(rawUrl: string): Promise<FxTweet> {
     signal: AbortSignal.timeout(20_000),
     headers: {
       accept: "application/json",
-      "user-agent": "Esqueletops-Nova/1.3 (+Telegram media bot)",
+      "user-agent": "Esqueletops-Nova/1.4 (+Telegram media bot)",
     },
   });
   if (!response.ok) throw new Error(`FxTwitter respondeu HTTP ${response.status}`);

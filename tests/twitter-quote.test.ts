@@ -28,4 +28,17 @@ describe("Twitter/X quote handling", () => {
     expect(caption).toContain("sarah 🍒");
     expect(caption).not.toContain("quoted.jpg");
   });
+
+  it("não usa a imagem do quote quando o tweet principal não tem mídia", () => {
+    expect(selectMainTweetMedia({
+      text: "comentário",
+      author: { name: "autor", screen_name: "autor" },
+      media: null,
+      quote: {
+        text: "tweet citado",
+        author: { name: "citado", screen_name: "citado" },
+        media: { photos: [{ type: "photo", url: "https://pbs.twimg.com/quoted.jpg" }] },
+      },
+    })).toEqual([]);
+  });
 });
