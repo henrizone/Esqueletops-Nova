@@ -87,7 +87,16 @@ async function sendOneLocalOrCached(
   };
   switch (item.kind) {
     case "photo": return ctx.replyWithPhoto(media, common);
-    case "video": return ctx.replyWithVideo(media, { ...common, supports_streaming: true });
+    case "video": {
+      const prepared = "path" in item ? item : undefined;
+      return ctx.replyWithVideo(media, {
+        ...common,
+        supports_streaming: true,
+        width: prepared?.width,
+        height: prepared?.height,
+        duration: prepared?.duration ? Math.round(prepared.duration) : undefined,
+      });
+    }
     case "audio": return ctx.replyWithAudio(media, { ...common, title: item.filename });
     default: return ctx.replyWithDocument(media, common);
   }
@@ -131,7 +140,13 @@ function preparedAlbumItem(item: PreparedMediaItem, options?: { caption: string;
   const media = new InputFile(item.path, item.filename);
   return item.kind === "photo"
     ? InputMediaBuilder.photo(media, options)
-    : InputMediaBuilder.video(media, { ...options, supports_streaming: true });
+    : InputMediaBuilder.video(media, {
+      ...options,
+      supports_streaming: true,
+      width: item.width,
+      height: item.height,
+      duration: item.duration ? Math.round(item.duration) : undefined,
+    });
 }
 
 function cachedAlbumItem(item: CachedMediaItem, options?: { caption: string; parse_mode: "HTML" }) {

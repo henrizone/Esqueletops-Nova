@@ -34,8 +34,8 @@ function activityFor(items: PreparedMediaItem[]) {
 /**
  * Fluxo equivalente ao SmudgeLord:
  * cache -> extrator específico -> baixa cada arquivo com o tipo correto ->
- * envia como foto, vídeo, áudio ou documento. FFmpeg só entra quando o arquivo
- * realmente precisa ser convertido.
+ * envia como foto, vídeo, áudio ou documento. Fotos seguem como JPEG e todo
+ * vídeo passa pelo perfil MP4/H.264 de 30 fps antes do envio.
  */
 export async function processDownload(ctx: BotContext, request: DownloadRequest): Promise<boolean> {
   const startedAt = Date.now();

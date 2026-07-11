@@ -20,6 +20,9 @@ export interface PreparedMediaItem {
   kind: MediaKind;
   filename: string;
   size: number;
+  width?: number;
+  height?: number;
+  duration?: number;
 }
 
 /**

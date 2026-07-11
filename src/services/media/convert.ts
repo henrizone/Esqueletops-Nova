@@ -18,6 +18,10 @@ const audioExtensions = new Set([".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav"
 
 export const TELEGRAM_PHOTO_EXTENSION = ".jpg";
 export const TELEGRAM_VIDEO_EXTENSION = ".mp4";
+export const TELEGRAM_VIDEO_FPS = 30;
+export const TELEGRAM_VIDEO_MAX_EDGE = 1280;
+export const TELEGRAM_VIDEO_AUDIO_BITRATE = 128_000;
+export const TELEGRAM_VIDEO_MAX_BITRATE = 2_000_000;
 
 async function isAnimatedImage(path: string, mime: string) {
   if (mime === "image/gif" || extname(path).toLowerCase() === ".gif") return true;
@@ -96,6 +100,8 @@ export interface ProbeStream {
   pix_fmt?: string;
   sample_aspect_ratio?: string;
   display_aspect_ratio?: string;
+  avg_frame_rate?: string;
+  r_frame_rate?: string;
   tags?: { rotate?: string };
   side_data_list?: Array<{ rotation?: number }>;
 }
@@ -104,6 +110,7 @@ interface ProbeResult {
   format?: {
     duration?: string;
     format_name?: string;
+    bit_rate?: string;
   };
   streams?: ProbeStream[];
 }
@@ -111,7 +118,7 @@ interface ProbeResult {
 async function probeMedia(path: string): Promise<ProbeResult> {
   const result = await execa(env.FFPROBE_BINARY, [
     "-v", "error",
-    "-show_entries", "format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio:stream_tags=rotate:stream_side_data=rotation",
+    "-show_entries", "format=duration,format_name,bit_rate:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,r_frame_rate:stream_tags=rotate:stream_side_data=rotation",
     "-of", "json",
     path,
   ], { timeout: 30_000 });
@@ -123,85 +130,118 @@ function durationFromProbe(probe: ProbeResult) {
   return Number.isFinite(value) && value > 0 ? value : 1;
 }
 
-function normalizedRotation(stream: ProbeStream) {
+function parseRatio(raw?: string) {
+  if (!raw || raw === "N/A" || raw === "0:1") return undefined;
+  const match = raw.trim().match(/^(-?\d+(?:\.\d+)?)[:/](-?\d+(?:\.\d+)?)$/);
+  if (!match) return undefined;
+  const left = Number(match[1]);
+  const right = Number(match[2]);
+  if (!Number.isFinite(left) || !Number.isFinite(right) || left <= 0 || right <= 0) return undefined;
+  return left / right;
+}
+
+function rotationFromStream(stream: ProbeStream) {
   const sideDataRotation = stream.side_data_list?.find((item) => Number.isFinite(item.rotation))?.rotation;
   const raw = sideDataRotation ?? Number(stream.tags?.rotate ?? 0);
   if (!Number.isFinite(raw)) return 0;
   return ((Math.round(raw) % 360) + 360) % 360;
 }
 
-function hasSquarePixels(stream: ProbeStream) {
-  const sar = stream.sample_aspect_ratio?.trim();
-  return !sar || sar === "1:1" || sar === "0:1" || sar === "N/A";
+function evenDimension(value: number) {
+  const rounded = Math.max(2, Math.round(value));
+  return rounded % 2 === 0 ? rounded : rounded - 1;
+}
+
+export interface VideoDimensions {
+  width: number;
+  height: number;
 }
 
 /**
- * Mantém a proporção real, limita cada lado a 1920 px, força dimensões pares
- * e pixels quadrados. `setsar=1` evita o vídeo achatado/esticado no iOS.
+ * Calcula as dimensões visuais reais antes de converter. Considera SAR/DAR e
+ * rotação do arquivo; depois reduz apenas quando algum lado excede 1280 px.
+ * Não corta, não adiciona bordas e nunca força 1:1.
  */
-export const telegramVideoFilter = [
-  // Primeiro transforma pixels anamórficos em pixels quadrados sem alterar a
-  // proporção visual. Depois aplica apenas redução, nunca esticamento.
-  "scale=w='max(2,trunc(iw*sar/2)*2)':h='max(2,trunc(ih/2)*2)':flags=lanczos",
-  "setsar=1",
-  "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:flags=lanczos",
-  "scale=w='max(2,trunc(iw/2)*2)':h='max(2,trunc(ih/2)*2)':flags=lanczos",
-  "setsar=1",
-  "format=yuv420p",
-].join(",");
+export function targetVideoDimensions(stream: ProbeStream): VideoDimensions {
+  const encodedWidth = Math.max(2, stream.width ?? 2);
+  const encodedHeight = Math.max(2, stream.height ?? 2);
+  const sar = parseRatio(stream.sample_aspect_ratio) ?? 1;
+  const declaredDar = parseRatio(stream.display_aspect_ratio);
 
-export function canFastRemuxVideo(stream: ProbeStream | undefined) {
-  if (!stream) return false;
-  const width = stream.width ?? 0;
-  const height = stream.height ?? 0;
-  return stream.codec_name === "h264"
-    && width > 0
-    && height > 0
-    && width <= 1920
-    && height <= 1920
-    && width % 2 === 0
-    && height % 2 === 0
-    && ["yuv420p", "yuvj420p"].includes(stream.pix_fmt ?? "")
-    && hasSquarePixels(stream)
-    && normalizedRotation(stream) === 0;
+  let displayWidth = encodedWidth * sar;
+  let displayHeight = encodedHeight;
+
+  if (declaredDar && Number.isFinite(declaredDar) && declaredDar > 0) {
+    displayWidth = displayHeight * declaredDar;
+  }
+
+  const rotation = rotationFromStream(stream);
+  if (rotation === 90 || rotation === 270) {
+    [displayWidth, displayHeight] = [displayHeight, displayWidth];
+  }
+
+  const scale = Math.min(
+    1,
+    TELEGRAM_VIDEO_MAX_EDGE / Math.max(displayWidth, 1),
+    TELEGRAM_VIDEO_MAX_EDGE / Math.max(displayHeight, 1),
+  );
+
+  return {
+    width: evenDimension(displayWidth * scale),
+    height: evenDimension(displayHeight * scale),
+  };
+}
+
+export function telegramVideoFilter(dimensions: VideoDimensions) {
+  return [
+    // O FFmpeg aplica a rotação de exibição automaticamente antes deste filtro.
+    // Escalar para dimensões calculadas pelo DAR/SAR remove anamorfismo sem
+    // achatar a imagem e sem preservar matrizes de rotação problemáticas no iOS.
+    `scale=${dimensions.width}:${dimensions.height}:flags=lanczos`,
+    "setsar=1",
+    `fps=${TELEGRAM_VIDEO_FPS}`,
+    "format=yuv420p",
+  ].join(",");
+}
+
+function bitrateCapForDimensions(width: number, height: number) {
+  const pixels = width * height;
+  if (pixels <= 426 * 240) return 650_000;
+  if (pixels <= 640 * 360) return 900_000;
+  if (pixels <= 854 * 480) return 1_250_000;
+  return TELEGRAM_VIDEO_MAX_BITRATE;
+}
+
+/**
+ * Mantém vídeos sociais 720p próximos de 2 Mbps (um Reel de 14 s fica perto
+ * de 3,5–4 MB), reduzindo automaticamente para vídeos longos caberem no limite.
+ */
+export function targetVideoBitrate(width: number, height: number, duration: number) {
+  const safeDuration = Math.max(1, duration);
+  const fitTotalBitrate = Math.floor((env.MAX_UPLOAD_BYTES * 8 * 0.88) / safeDuration);
+  const fitVideoBitrate = Math.max(260_000, fitTotalBitrate - TELEGRAM_VIDEO_AUDIO_BITRATE);
+  return Math.min(bitrateCapForDimensions(width, height), fitVideoBitrate);
 }
 
 function videoOutput(input: string) {
   return normalizedPath(input, "-telegram", TELEGRAM_VIDEO_EXTENSION);
 }
 
-async function remuxOrCopyVideo(input: string, output: string, audioCodec?: string) {
-  const args = [
-    "-y",
-    "-i", input,
-    "-map", "0:v:0",
-    "-map", "0:a?",
-    "-map_metadata", "-1",
-    "-sn",
-    "-dn",
-    "-c:v", "copy",
-  ];
-
-  if (audioCodec && audioCodec !== "aac") {
-    args.push("-c:a", "aac", "-b:a", "128k");
-  } else {
-    args.push("-c:a", "copy");
-  }
-
-  args.push(
-    "-metadata:s:v:0", "rotate=0",
-    "-movflags", "+faststart",
-    "-f", "mp4",
-    output,
-  );
-  await execa(env.FFMPEG_BINARY, args, { timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000 });
+interface NormalizedVideo {
+  path: string;
+  width: number;
+  height: number;
+  duration: number;
 }
 
-async function transcodeVideo(input: string, output: string, duration: number) {
-  const availableBits = Math.max(2_000_000, env.MAX_UPLOAD_BYTES * 8 * 0.90);
-  const audioBitrate = 128_000;
-  const fitBitrate = Math.max(220_000, Math.floor(availableBits / duration - audioBitrate));
-  const videoBitrate = Math.min(8_000_000, fitBitrate);
+async function transcodeVideo(
+  input: string,
+  output: string,
+  stream: ProbeStream,
+  duration: number,
+): Promise<NormalizedVideo> {
+  const dimensions = targetVideoDimensions(stream);
+  const videoBitrate = targetVideoBitrate(dimensions.width, dimensions.height, duration);
 
   await execa(env.FFMPEG_BINARY, [
     "-y",
@@ -209,54 +249,57 @@ async function transcodeVideo(input: string, output: string, duration: number) {
     "-map", "0:v:0",
     "-map", "0:a?",
     "-map_metadata", "-1",
+    "-map_chapters", "-1",
     "-sn",
     "-dn",
-    "-vf", telegramVideoFilter,
+    "-vf", telegramVideoFilter(dimensions),
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-b:v", String(videoBitrate),
-    "-maxrate", String(Math.floor(videoBitrate * 1.20)),
+    "-maxrate", String(Math.floor(videoBitrate * 1.12)),
     "-bufsize", String(videoBitrate * 2),
     "-pix_fmt", "yuv420p",
-    "-profile:v", "high",
-    "-level:v", "4.1",
+    "-profile:v", "main",
+    "-level:v", "4.0",
     "-tag:v", "avc1",
     "-c:a", "aac",
-    "-b:a", "128k",
+    "-b:a", String(TELEGRAM_VIDEO_AUDIO_BITRATE),
+    "-ar", "48000",
+    "-ac", "2",
     "-metadata:s:v:0", "rotate=0",
     "-movflags", "+faststart",
+    "-max_muxing_queue_size", "2048",
     "-f", "mp4",
     output,
   ], { timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000 });
+
+  return { path: output, width: dimensions.width, height: dimensions.height, duration };
 }
 
 /**
- * Todo vídeo, GIF ou imagem animada termina como MP4 H.264/AAC. Quando o vídeo
- * já é H.264, o fluxo rápido apenas remuxa para MP4 e copia o stream de vídeo;
- * a recodificação completa só acontece quando o codec é incompatível ou o
- * arquivo continua acima do limite.
+ * Todo vídeo, Reel, GIF ou imagem animada passa pelo mesmo perfil final:
+ * MP4/H.264/AAC, 30 fps, pixels quadrados, proporção visual preservada e
+ * bitrate reduzido. A recodificação única remove metadados que fazem o vídeo
+ * aparecer espremido no Telegram para iOS.
  */
-async function normalizeVideo(input: string) {
+async function normalizeVideo(input: string): Promise<NormalizedVideo> {
   const output = videoOutput(input);
   const probe = await probeMedia(input);
   const video = probe.streams?.find((stream) => stream.codec_type === "video");
-  const audio = probe.streams?.find((stream) => stream.codec_type === "audio");
   const duration = durationFromProbe(probe);
 
   if (!video) throw new Error("Arquivo classificado como vídeo não possui stream de vídeo");
 
-  if (canFastRemuxVideo(video)) {
-    try {
-      await remuxOrCopyVideo(input, output, audio?.codec_name);
-      if (await fileSize(output) <= env.MAX_UPLOAD_BYTES) return output;
-      logger.debug({ input, size: await fileSize(output) }, "MP4 compatível excedeu o limite; comprimindo");
-    } catch (error) {
-      logger.debug({ input, error }, "Remux rápido falhou; convertendo vídeo para H.264/AAC");
-    }
-  }
-
-  await transcodeVideo(input, output, duration);
-  return output;
+  const normalized = await transcodeVideo(input, output, video, duration);
+  logger.debug({
+    input,
+    output,
+    width: normalized.width,
+    height: normalized.height,
+    fps: TELEGRAM_VIDEO_FPS,
+    bitrate: targetVideoBitrate(normalized.width, normalized.height, duration),
+  }, "Vídeo convertido para o perfil universal do Telegram");
+  return normalized;
 }
 
 async function convertAudio(input: string) {
@@ -276,20 +319,35 @@ async function convertAudio(input: string) {
 async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem | undefined> {
   let kind = await detectMediaKind(original);
   let path = original;
+  let width: number | undefined;
+  let height: number | undefined;
+  let duration: number | undefined;
 
-  if (kind === "photo") path = await normalizePhoto(original);
-  else if (kind === "video") path = await normalizeVideo(original);
-  else if (kind === "audio" && extname(original).toLowerCase() !== ".mp3") path = await convertAudio(original);
+  if (kind === "photo") {
+    path = await normalizePhoto(original);
+  } else if (kind === "video") {
+    const normalized = await normalizeVideo(original);
+    path = normalized.path;
+    width = normalized.width;
+    height = normalized.height;
+    duration = normalized.duration;
+  } else if (kind === "audio" && extname(original).toLowerCase() !== ".mp3") {
+    path = await convertAudio(original);
+  }
 
   let size = await fileSize(path);
   if (size > env.MAX_UPLOAD_BYTES) {
-    path = kind === "photo"
-      ? await normalizePhoto(path)
-      : kind === "video"
-        ? await normalizeVideo(path)
-        : kind === "audio"
-          ? await convertAudio(path)
-          : path;
+    if (kind === "photo") {
+      path = await normalizePhoto(path);
+    } else if (kind === "video") {
+      const normalized = await normalizeVideo(path);
+      path = normalized.path;
+      width = normalized.width;
+      height = normalized.height;
+      duration = normalized.duration;
+    } else if (kind === "audio") {
+      path = await convertAudio(path);
+    }
     size = await fileSize(path);
   }
 
@@ -318,18 +376,17 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
     throw new Error(`Vídeo não foi normalizado para MP4: ${basename(path)}`);
   }
 
-  logger.debug({ path, kind, extension, size }, "Mídia normalizada para o Telegram");
-  return { path, kind, filename: basename(path), size };
+  logger.debug({ path, kind, extension, size, width, height, duration }, "Mídia normalizada para o Telegram");
+  return { path, kind, filename: basename(path), size, width, height, duration };
 }
 
 /**
- * Ponto único de normalização usado por /dl, /sdl, /ytdl, Shorts e pelo
- * download automático de todas as plataformas. Mantém a ordem do álbum e
- * processa no máximo poucas mídias em paralelo para responder rápido sem
- * saturar CPU/RAM do container.
+ * Ponto único usado por /dl, /sdl, /ytdl, Shorts e download automático de
+ * todas as plataformas. Mantém a ordem do álbum e limita a concorrência para
+ * responder rápido sem saturar CPU/RAM do container.
  */
 export async function prepareMediaFiles(paths: string[]): Promise<PreparedMediaItem[]> {
-  const queue = new PQueue({ concurrency: Math.min(env.DOWNLOAD_CONCURRENCY, 3) });
+  const queue = new PQueue({ concurrency: Math.min(env.DOWNLOAD_CONCURRENCY, 2) });
   const prepared = await Promise.all(paths.map((path) => queue.add(() => prepareOneMediaFile(path))));
   return prepared.filter((item): item is PreparedMediaItem => Boolean(item));
 }

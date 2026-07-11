@@ -36,10 +36,11 @@ describe("álbuns de mídia", () => {
 });
 
 describe("conversão de vídeo", () => {
-  it("força dimensões pares e pixels quadrados sem esticar no iOS", () => {
-    expect(telegramVideoFilter).toContain("trunc(iw/2)*2");
-    expect(telegramVideoFilter).toContain("trunc(ih/2)*2");
-    expect(telegramVideoFilter).toContain("iw*sar");
-    expect(telegramVideoFilter).toContain("setsar=1");
+  it("envia dimensões explícitas sem forçar proporção 1:1", () => {
+    const filter = telegramVideoFilter({ width: 720, height: 1280 });
+    expect(filter).toContain("scale=720:1280");
+    expect(filter).toContain("fps=30");
+    expect(filter).not.toContain("pad=");
+    expect(filter).not.toContain("crop=");
   });
 });
