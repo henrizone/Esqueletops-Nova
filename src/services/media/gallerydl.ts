@@ -76,7 +76,8 @@ export async function downloadWithGalleryDl(url: string) {
     "--no-colors",
     "--no-part",
     "--no-mtime",
-    "--retries", "3",
+    "--retries", "1",
+    "-o", "extractor.instagram.sleep-429=null",
     "--http-timeout", "20",
     "--range", `1-${env.MAX_MEDIA_ITEMS}`,
     "--filesize-max", `${Math.ceil(env.MAX_UPLOAD_MB * 2)}M`,
@@ -90,7 +91,7 @@ export async function downloadWithGalleryDl(url: string) {
 
   logger.debug({ url }, "gallery-dl");
   await execa(env.GALLERYDL_BINARY, args, {
-    timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000,
+    timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS, 60) * 1000,
     maxBuffer: 50 * 1024 * 1024,
   });
 

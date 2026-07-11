@@ -8,7 +8,7 @@ import { escapeHtml, truncate } from "../../utils/html.js";
 import type { BotContext } from "../../types/context.js";
 import { buildMediaCaption } from "./caption.js";
 import { prepareMediaFiles } from "./convert.js";
-import { sendCachedMedia, sendPreparedMedia } from "./sender.js";
+import { sendCachedMedia, sendPreparedMedia, sendTextPost } from "./sender.js";
 import type { CachedMediaPayload, DownloadRequest } from "./types.js";
 import { mediaCacheKey } from "./urls.js";
 import { downloadMedia, probeMedia } from "./ytdlp.js";
@@ -73,17 +73,24 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
         }
         const downloaded = await downloadMedia(request.url, request.mode);
         directory = downloaded.directory;
-        const metadata = { ...downloaded.metadata, ...probedMetadata, webpageUrl: probedMetadata?.webpageUrl ?? downloaded.metadata.webpageUrl ?? request.url };
+        const metadata = { ...probedMetadata, ...downloaded.metadata, webpageUrl: downloaded.metadata.webpageUrl ?? probedMetadata?.webpageUrl ?? request.url };
         if (metadata.duration && metadata.duration > limit) {
           if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadTooLong"), { parse_mode: "HTML" });
           return false;
+        }
+        const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
+        if (!downloaded.files.length && metadata.captionHtml) {
+          await sendTextPost(ctx, caption, request.replyToMessageId, request.url);
+          if (request.deleteSource && request.sourceMessageId && ctx.chat) {
+            await ctx.api.deleteMessage(ctx.chat.id, request.sourceMessageId).catch(() => undefined);
+          }
+          return true;
         }
         const prepared = await prepareMediaFiles(downloaded.files);
         if (!prepared.length) {
           if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadNoMedia"), { parse_mode: "HTML" });
           return false;
         }
-        const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
         const items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId, request.url);
         if (items.length) {
           await cacheSetJson(`media:${key}`, { items, metadata, cachedAt: new Date().toISOString() } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);

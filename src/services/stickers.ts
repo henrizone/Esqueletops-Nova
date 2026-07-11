@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { execa } from "execa";
-import { GrammyError, InputFile } from "grammy";
+import { InputFile } from "grammy";
 import type { InputSticker, Message } from "grammy/types";
 import sharp from "sharp";
 import { env } from "../config/env.js";
@@ -95,10 +95,28 @@ export async function addStickerToPack(ctx: BotContext, userId: number, name: st
   await ctx.api.addStickerToSet(userId, name, stickerInput(prepared));
 }
 
+function stickerErrorText(error: unknown, depth = 0): string {
+  if (depth > 4 || error == null) return "";
+  if (typeof error === "string") return error;
+  if (error instanceof Error) {
+    const record = error as Error & { description?: unknown; shortMessage?: unknown; cause?: unknown };
+    return [record.name, record.message, record.description, record.shortMessage, stickerErrorText(record.cause, depth + 1)]
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .join(" ");
+  }
+  if (typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    return ["description", "message", "shortMessage", "error", "cause"]
+      .map((key) => stickerErrorText(record[key], depth + 1))
+      .filter(Boolean)
+      .join(" ");
+  }
+  return String(error);
+}
+
 export function isStickerSetInvalidError(error: unknown): boolean {
-  return error instanceof GrammyError
-    && error.error_code === 400
-    && /STICKERSET_INVALID|sticker set (?:not found|is invalid)/i.test(error.description);
+  const text = stickerErrorText(error);
+  return /STICKERSET_INVALID|STICKER_SET_INVALID|sticker\s*set\s*(?:not\s*found|is\s*invalid|invalid)|pacote.+(?:não existe|inválido)/i.test(text);
 }
 
 export async function getTelegramStickerPack(ctx: BotContext, name: string) {

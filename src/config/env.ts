@@ -30,6 +30,8 @@ const schema = z.object({
   YTDLP_BINARY: z.string().default("yt-dlp"),
   GALLERYDL_BINARY: z.string().default("gallery-dl"),
   GALLERYDL_ENABLED: bool.default(true),
+  INSTAGRAM_EMBED_ENABLED: bool.default(true),
+  FXTWITTER_API_URL: z.string().url().default("https://api.fxtwitter.com"),
   FFMPEG_BINARY: z.string().default("ffmpeg"),
   FFPROBE_BINARY: z.string().default("ffprobe"),
   YTDLP_COOKIES_B64: optional,

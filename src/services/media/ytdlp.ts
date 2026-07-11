@@ -6,6 +6,8 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { DownloadMode, MediaMetadata } from "./types.js";
 import { downloadWithGalleryDl } from "./gallerydl.js";
+import { downloadInstagramMedia, isInstagramPostUrl } from "./instagram.js";
+import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
 
 interface Info {
   id?: string;
@@ -147,18 +149,36 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode) {
 }
 
 export async function downloadMedia(url: string, mode: DownloadMode) {
+  if (mode !== "audio" && isTwitterStatusUrl(url)) {
+    // O extrator dedicado seleciona somente as mídias do tweet principal e
+    // mantém o tweet citado apenas como texto. O yt-dlp não garante isso.
+    return downloadTwitterMedia(url);
+  }
+
+  const extractorErrors: unknown[] = [];
+  if (mode !== "audio" && env.INSTAGRAM_EMBED_ENABLED && isInstagramPostUrl(url)) {
+    try {
+      return await downloadInstagramMedia(url);
+    } catch (error) {
+      extractorErrors.push(error);
+      logger.info({ url, error }, "Embed do Instagram indisponível; tentando yt-dlp");
+    }
+  }
+
   try {
     return await downloadWithYtDlp(url, mode);
   } catch (ytDlpError) {
-    if (mode === "audio" || !env.GALLERYDL_ENABLED) throw ytDlpError;
+    extractorErrors.push(ytDlpError);
+    if (mode === "audio" || !env.GALLERYDL_ENABLED) {
+      if (extractorErrors.length === 1) throw ytDlpError;
+      throw new AggregateError(extractorErrors, "Nenhum extrator conseguiu baixar a publicação");
+    }
     logger.info({ url, error: ytDlpError }, "yt-dlp não encontrou mídia; tentando fallback com gallery-dl");
     try {
       return await downloadWithGalleryDl(url);
     } catch (galleryDlError) {
-      throw new AggregateError(
-        [ytDlpError, galleryDlError],
-        "Nenhum extrator conseguiu baixar a publicação",
-      );
+      extractorErrors.push(galleryDlError);
+      throw new AggregateError(extractorErrors, "Nenhum extrator conseguiu baixar a publicação");
     }
   }
 }

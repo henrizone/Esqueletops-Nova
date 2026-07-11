@@ -46,14 +46,41 @@ function chunks<T>(items: T[], size: number): T[][] {
   return result;
 }
 
-async function sendAlbumSourceButton(ctx: BotContext, sourceUrl: string | undefined, replyToMessageId?: number) {
-  if (!env.MEDIA_SOURCE_BUTTON || !sourceUrl) return;
-  const keyboard = sourceKeyboard(sourceUrl);
-  if (!keyboard) return;
-  // sendMediaGroup não aceita reply_markup. Para álbuns, o botão fica em uma
-  // mensagem compacta logo abaixo, respondendo à primeira mídia do álbum.
-  await ctx.reply("🔗", {
-    reply_markup: keyboard,
+/**
+ * Quando existe botão de origem, as mídias são enviadas individualmente para
+ * que o botão fique na própria mensagem de mídia. sendMediaGroup não aceita
+ * reply_markup, então não usamos uma mensagem "🔗" separada.
+ */
+async function sendSequential<T extends PreparedMediaItem | CachedMediaItem>(
+  ctx: BotContext,
+  items: T[],
+  caption: string,
+  replyToMessageId?: number,
+  sourceUrl?: string,
+): Promise<Message[]> {
+  const messages: Message[] = [];
+  for (let index = 0; index < items.length; index += 1) {
+    messages.push(await sendOne(
+      ctx,
+      items[index]!,
+      index === 0 ? caption : "",
+      index === 0 ? replyToMessageId : undefined,
+      index === 0 ? sourceUrl : undefined,
+    ));
+  }
+  return messages;
+}
+
+export async function sendTextPost(
+  ctx: BotContext,
+  caption: string,
+  replyToMessageId?: number,
+  sourceUrl?: string,
+): Promise<void> {
+  await ctx.reply(caption || "Publicação sem mídia.", {
+    parse_mode: "HTML",
+    reply_markup: env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined,
+    link_preview_options: { is_disabled: true },
     ...replyParams(replyToMessageId),
   });
 }
@@ -65,28 +92,21 @@ export async function sendPreparedMedia(
   replyToMessageId?: number,
   sourceUrl?: string,
 ): Promise<CachedMediaItem[]> {
-  if (items.some((item) => item.kind === "audio" || item.kind === "document")) {
-    const cached: CachedMediaItem[] = [];
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index]!;
-      const message = await sendOne(
-        ctx,
-        item,
-        index === 0 ? caption : "",
-        index === 0 ? replyToMessageId : undefined,
-        index === 0 ? sourceUrl : undefined,
-      );
+  const mustSendSequentially = Boolean(env.MEDIA_SOURCE_BUTTON && sourceUrl)
+    || items.some((item) => item.kind === "audio" || item.kind === "document");
+
+  if (mustSendSequentially) {
+    const messages = await sendSequential(ctx, items, caption, replyToMessageId, sourceUrl);
+    return messages.flatMap((message, index) => {
+      const item = items[index];
+      if (!item) return [];
       const fileId = fileIdFromMessage(message, item.kind);
-      if (fileId) cached.push({ kind: item.kind, fileId, filename: item.filename });
-    }
-    return cached;
+      return fileId ? [{ kind: item.kind, fileId, filename: item.filename } satisfies CachedMediaItem] : [];
+    });
   }
 
   const cached: CachedMediaItem[] = [];
   let globalIndex = 0;
-  let firstAlbumMessageId: number | undefined;
-  let usedMediaGroup = false;
-  let sourceButtonAttached = false;
   for (const groupItems of chunks(items, 10)) {
     if (groupItems.length === 1) {
       const item = groupItems[0]!;
@@ -95,15 +115,13 @@ export async function sendPreparedMedia(
         item,
         globalIndex === 0 ? caption : "",
         globalIndex === 0 ? replyToMessageId : undefined,
-        sourceUrl,
       );
-      sourceButtonAttached = Boolean(sourceUrl);
       const fileId = fileIdFromMessage(message, item.kind);
       if (fileId) cached.push({ kind: item.kind, fileId, filename: item.filename });
       globalIndex += 1;
       continue;
     }
-    usedMediaGroup = true;
+
     const group = groupItems.map((item, index) => {
       const media = new InputFile(item.path, item.filename);
       const options = globalIndex === 0 && index === 0 && caption ? { caption, parse_mode: "HTML" as const } : undefined;
@@ -112,7 +130,6 @@ export async function sendPreparedMedia(
         : InputMediaBuilder.video(media, { ...options, supports_streaming: true });
     });
     const messages = await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
-    firstAlbumMessageId ??= messages[0]?.message_id;
     messages.forEach((message, index) => {
       const item = groupItems[index];
       if (!item) return;
@@ -121,7 +138,6 @@ export async function sendPreparedMedia(
     });
     globalIndex += groupItems.length;
   }
-  if (usedMediaGroup && !sourceButtonAttached) await sendAlbumSourceButton(ctx, sourceUrl, firstAlbumMessageId);
   return cached;
 }
 
@@ -132,23 +148,14 @@ export async function sendCachedMedia(
   replyToMessageId?: number,
   sourceUrl?: string,
 ): Promise<void> {
-  if (payload.items.some((item) => item.kind === "audio" || item.kind === "document")) {
-    for (let index = 0; index < payload.items.length; index += 1) {
-      await sendOne(
-        ctx,
-        payload.items[index]!,
-        index === 0 ? caption : "",
-        index === 0 ? replyToMessageId : undefined,
-        index === 0 ? sourceUrl : undefined,
-      );
-    }
+  const mustSendSequentially = Boolean(env.MEDIA_SOURCE_BUTTON && sourceUrl)
+    || payload.items.some((item) => item.kind === "audio" || item.kind === "document");
+  if (mustSendSequentially) {
+    await sendSequential(ctx, payload.items, caption, replyToMessageId, sourceUrl);
     return;
   }
 
   let globalIndex = 0;
-  let firstAlbumMessageId: number | undefined;
-  let usedMediaGroup = false;
-  let sourceButtonAttached = false;
   for (const groupItems of chunks(payload.items, 10)) {
     if (groupItems.length === 1) {
       await sendOne(
@@ -156,22 +163,17 @@ export async function sendCachedMedia(
         groupItems[0]!,
         globalIndex === 0 ? caption : "",
         globalIndex === 0 ? replyToMessageId : undefined,
-        sourceUrl,
       );
-      sourceButtonAttached = Boolean(sourceUrl);
       globalIndex += 1;
       continue;
     }
-    usedMediaGroup = true;
     const group = groupItems.map((item, index) => {
       const options = globalIndex === 0 && index === 0 && caption ? { caption, parse_mode: "HTML" as const } : undefined;
       return item.kind === "photo"
         ? InputMediaBuilder.photo(item.fileId, options)
         : InputMediaBuilder.video(item.fileId, { ...options, supports_streaming: true });
     });
-    const messages = await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
-    firstAlbumMessageId ??= messages[0]?.message_id;
+    await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
     globalIndex += groupItems.length;
   }
-  if (usedMediaGroup && !sourceButtonAttached) await sendAlbumSourceButton(ctx, sourceUrl, firstAlbumMessageId);
 }
