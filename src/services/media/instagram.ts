@@ -55,6 +55,14 @@ export function isInstagramPostUrl(rawUrl: string) {
   }
 }
 
+export function isInstagramReelUrl(rawUrl: string) {
+  try {
+    return /\/(?:reel|reels)\/[A-Za-z0-9_-]+/i.test(new URL(rawUrl).pathname);
+  } catch {
+    return false;
+  }
+}
+
 function shortcode(rawUrl: string) {
   const match = new URL(rawUrl).pathname.match(/\/(?:p|reel|reels)\/([A-Za-z0-9_-]+)/i);
   if (!match?.[1]) throw new Error("Código da publicação do Instagram não encontrado");
@@ -245,6 +253,25 @@ function metaContent(html: string, property: string) {
   return undefined;
 }
 
+/**
+ * Detecta somente sinais fortes de que a publicação é vídeo. Não usamos
+ * ocorrências genéricas de "video_url" em scripts globais, pois isso pode
+ * transformar uma foto normal em falso positivo.
+ */
+export function instagramPageExpectsVideo(rawUrl: string, html: string) {
+  if (isInstagramReelUrl(rawUrl)) return true;
+  const ogType = metaContent(html, "og:type") ?? "";
+  const ogTitle = metaContent(html, "og:title") ?? "";
+  return Boolean(
+    metaContent(html, "og:video")
+    || metaContent(html, "og:video:url")
+    || /^video(?:\.|$)/i.test(ogType)
+    || /^video by\b/i.test(ogTitle.trim())
+    || /data-media-type=["'](?:GraphVideo|XDTGraphVideo)["']/i.test(html)
+    || /<video\b/i.test(html)
+  );
+}
+
 function bestImage(node: InstagramNode) {
   const resources = [...(node.display_resources ?? [])]
     .filter((item) => item.src)
@@ -299,7 +326,7 @@ async function fetchEmbed(code: string): Promise<{ html: string; node?: Instagra
   });
   if (!response.ok) throw new Error(`Embed do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
-  return { html, node: extractInstagramGqlData(html) ?? extractInstagramSingleImage(html)?.node };
+  return { html, node: extractInstagramGqlData(html) };
 }
 
 async function fetchPublicPage(code: string): Promise<{ html: string; node?: InstagramNode }> {
@@ -310,7 +337,7 @@ async function fetchPublicPage(code: string): Promise<{ html: string; node?: Ins
   });
   if (!response.ok) throw new Error(`Página do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
-  return { html, node: extractInstagramGqlData(html) ?? extractInstagramSingleImage(html)?.node };
+  return { html, node: extractInstagramGqlData(html) };
 }
 
 async function fetchScraper(code: string): Promise<InstagramNode | undefined> {
@@ -395,21 +422,43 @@ export async function downloadInstagramMedia(rawUrl: string): Promise<Downloaded
   const fallback = html
     ? fallbackFromMeta(html)
     : { items: [] as RemoteMediaItem[], metadata: {} as MediaMetadata };
-  const remoteItems = node ? instagramNodeRemoteItems(node) : fallback.items;
+  const singleImage = html ? extractInstagramSingleImage(html) : undefined;
+  const expectsVideo = html ? instagramPageExpectsVideo(rawUrl, html) : isInstagramReelUrl(rawUrl);
+
+  let remoteItems = node ? instagramNodeRemoteItems(node) : fallback.items;
+  let selectedNode = node;
+  let extractor = node ? "instagram-smudge-direct" : "instagram-meta";
+
+  // O embed de Reel costuma trazer somente og:image/thumbnail. Antes, esse
+  // thumbnail era promovido a publicação e enviado com sendPhoto. Quando a
+  // URL ou o HTML indicam vídeo, uma resposta contendo apenas fotos é
+  // rejeitada para que o fluxo avance ao yt-dlp e obtenha o MP4 real.
+  if (expectsVideo && remoteItems.length && !remoteItems.some((item) => item.kind === "video")) {
+    throw new Error("Instagram retornou apenas a capa de uma publicação em vídeo");
+  }
+
+  // O parser visual do SmudgeLord continua disponível apenas como último
+  // fallback para uma foto verdadeira, nunca antes do GraphQL/metadados.
+  if (!remoteItems.length && singleImage && !expectsVideo) {
+    selectedNode = singleImage.node;
+    remoteItems = instagramNodeRemoteItems(singleImage.node);
+    extractor = "instagram-smudge-image-fallback";
+  }
+
   if (!remoteItems.length) throw new Error("Instagram não retornou fotos ou vídeos");
 
-  const caption = node?.edge_media_to_caption?.edges?.[0]?.node?.text;
+  const caption = selectedNode?.edge_media_to_caption?.edges?.[0]?.node?.text;
   return {
     files: [],
     remoteItems,
     metadata: {
-      id: node?.id ?? code,
-      title: fallback.metadata.title,
+      id: selectedNode?.id ?? code,
+      title: fallback.metadata.title ?? singleImage?.title,
       description: caption ?? fallback.metadata.description,
-      uploader: node?.owner?.username,
-      uploaderId: node?.owner?.username,
+      uploader: selectedNode?.owner?.username,
+      uploaderId: selectedNode?.owner?.username,
       webpageUrl: rawUrl,
-      extractor: node ? "instagram-smudge-direct" : "instagram-meta",
+      extractor,
     },
   };
 }
