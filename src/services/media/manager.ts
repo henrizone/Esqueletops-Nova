@@ -23,7 +23,11 @@ async function logFailure(ctx: BotContext, code: string, request: DownloadReques
 }
 
 async function sendActivity(ctx: BotContext, request: DownloadRequest) {
-  const action = request.mode === "audio" ? "upload_voice" : "upload_video";
+  // Mesmo indicador do Smudge (sendMediaAndHandleCaption -> chatActionUploadDoc):
+  // "upload_document" é o padrão genérico pra links (foto, vídeo ou álbum
+  // misto). "upload_video" no Smudge só aparece no fluxo específico do botão
+  // inline do YouTube, não no download automático por link.
+  const action = request.mode === "audio" ? "upload_voice" : "upload_document";
   await ctx.api.sendChatAction(request.chatId, action).catch(() => undefined);
 }
 
