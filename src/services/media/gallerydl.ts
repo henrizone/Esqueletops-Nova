@@ -1,22 +1,11 @@
-import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { execa } from "execa";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { MediaMetadata } from "./types.js";
-
-let cookiePromise: Promise<string | undefined> | undefined;
-
-async function cookieFile() {
-  if (!env.YTDLP_COOKIES_B64) return undefined;
-  cookiePromise ??= (async () => {
-    const path = join(tmpdir(), "esqueletops-nova-cookies.txt");
-    await writeFile(path, Buffer.from(env.YTDLP_COOKIES_B64!, "base64"), { mode: 0o600 });
-    return path;
-  })();
-  return cookiePromise;
-}
+import { cookieFileForUrl } from "./cookies.js";
 
 async function walk(root: string): Promise<string[]> {
   const output: string[] = [];
@@ -84,7 +73,7 @@ export async function downloadWithGalleryDl(url: string) {
     "--write-info-json",
     "--directory", directory,
   ];
-  const cookies = await cookieFile();
+  const cookies = await cookieFileForUrl(url);
   if (cookies) args.push("--cookies", cookies);
   if (env.YTDLP_PROXY) args.push("--proxy", env.YTDLP_PROXY);
   args.push(url);

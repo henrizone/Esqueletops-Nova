@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractUrls, isAllowedMediaUrl, mediaCacheKey, normalizeUrl } from "../src/services/media/urls.js";
+import { extractUrls, isAllowedMediaUrl, isAutoMediaUrl, mediaCacheKey, normalizeUrl } from "../src/services/media/urls.js";
 
 describe("media URLs", () => {
   it("extrai links e remove pontuação final", () => {
@@ -12,5 +12,10 @@ describe("media URLs", () => {
   it("normaliza parâmetros de rastreamento para o cache", () => {
     expect(normalizeUrl("https://youtu.be/abc?si=123&utm_source=test")).toBe("https://youtu.be/abc");
     expect(mediaCacheKey("https://youtu.be/abc?si=123", "video")).toBe(mediaCacheKey("https://youtu.be/abc", "video"));
+  });
+  it("replica o detector do SmudgeLord para YouTube", () => {
+    expect(isAutoMediaUrl("https://www.youtube.com/shorts/abc123")).toBe(true);
+    expect(isAutoMediaUrl("https://www.youtube.com/watch?v=abc123")).toBe(false);
+    expect(isAutoMediaUrl("https://youtu.be/abc123")).toBe(false);
   });
 });

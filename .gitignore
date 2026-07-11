@@ -6,3 +6,6 @@ coverage/
 .tmp/
 tmp/
 cookies.txt
+cookies*.txt
+*secrets*.txt
+.env.cookies

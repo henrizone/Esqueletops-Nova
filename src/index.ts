@@ -14,6 +14,7 @@ import {
 import { env } from "./config/env.js";
 import { logger } from "./config/logger.js";
 import { closeDatabase, connectDatabase, db } from "./database/index.js";
+import { cookieConfigurationStatus } from "./services/media/cookies.js";
 
 const app = Fastify({ logger: false, bodyLimit: 20 * 1024 * 1024 });
 let ready = false;
@@ -197,6 +198,8 @@ async function main() {
 
   logger.info("Conectando ao Redis");
   await connectRedis();
+
+  logger.info({ cookies: cookieConfigurationStatus() }, "Configuração de cookies carregada");
 
   logger.info("Inicializando cliente do Telegram");
   await bot.init();

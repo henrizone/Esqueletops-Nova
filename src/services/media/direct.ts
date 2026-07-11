@@ -96,7 +96,7 @@ export async function materializeRemoteItems(
 ): Promise<{ directory: string; files: string[] }> {
   const directory = await createMediaTempDirectory("esqueletops-nova-remote-");
   try {
-    const files = await Promise.all(items.map(async (item, index) => {
+    const results = await Promise.allSettled(items.map(async (item, index) => {
       const urls = [item.url, ...(item.fallbackUrls ?? [])]
         .filter((url, position, all) => all.indexOf(url) === position);
       let lastError: unknown;
@@ -116,6 +116,12 @@ export async function materializeRemoteItems(
       }
       throw lastError ?? new Error("Não foi possível baixar a mídia remota");
     }));
+
+    const files = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    if (!files.length) {
+      const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      throw new AggregateError(errors, "Nenhuma mídia remota pôde ser baixada");
+    }
     return { directory, files };
   } catch (error) {
     await cleanupDirectory(directory);

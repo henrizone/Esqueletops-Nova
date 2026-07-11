@@ -25,7 +25,7 @@ ENV NODE_ENV=production \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 python3-venv tini \
     && python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp==${YTDLP_VERSION}" "gallery-dl==${GALLERYDL_VERSION}" \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp[default]==${YTDLP_VERSION}" "gallery-dl==${GALLERYDL_VERSION}" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

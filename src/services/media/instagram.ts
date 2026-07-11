@@ -1,6 +1,7 @@
 import { env } from "../../config/env.js";
 import { browserHeaders } from "./direct.js";
 import type { DownloadedMedia, MediaMetadata, RemoteMediaItem } from "./types.js";
+import { instagramCookieHeader, instagramCsrfToken } from "./cookies.js";
 
 interface InstagramNode {
   __typename?: string;
@@ -33,49 +34,14 @@ const instagramHeaders: Record<string, string> = {
   "sec-ch-ua-platform": '"Windows"',
 };
 
-interface InstagramSession {
-  cookie: string;
-  csrfToken: string;
-}
-
-let sessionPromise: Promise<InstagramSession> | undefined;
-
-/**
- * O SmudgeLord original também faz chamadas "cruas", sem sessão — mas o
- * Instagram vem endurecendo a checagem de bots e passou a exigir cookies
- * válidos (csrftoken/mid/ig_did) até para o /embed/. Sem isso, o embed, a
- * página pública e o GraphQL voltam sem o payload de mídia, mesmo com
- * HTTP 200. Buscamos uma sessão anônima uma vez e reaproveitamos.
- */
-async function bootstrapSession(): Promise<InstagramSession> {
-  const response = await fetch("https://www.instagram.com/", {
-    redirect: "follow",
-    signal: AbortSignal.timeout(10_000),
-    headers: { ...instagramHeaders, referer: "https://www.instagram.com/" },
-  });
-
-  const rawCookies = typeof (response.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie === "function"
-    ? (response.headers as unknown as { getSetCookie: () => string[] }).getSetCookie()
-    : (response.headers.get("set-cookie") ? [response.headers.get("set-cookie")!] : []);
-
-  const jar = new Map<string, string>();
-  for (const raw of rawCookies) {
-    const [pair] = raw.split(";");
-    const [name, ...rest] = (pair ?? "").split("=");
-    if (name && rest.length) jar.set(name.trim(), rest.join("=").trim());
-  }
-
-  const csrfToken = jar.get("csrftoken") ?? "JKA19cNYckTn_Dr6bcTO5F";
-  const cookie = [...jar.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
-  return { cookie, csrfToken };
-}
-
-async function getSession(): Promise<InstagramSession> {
-  sessionPromise ??= bootstrapSession().catch((error) => {
-    sessionPromise = undefined;
-    throw error;
-  });
-  return sessionPromise;
+function requestHeaders(extra: Record<string, string> = {}) {
+  const cookie = instagramCookieHeader();
+  return {
+    ...instagramHeaders,
+    "x-ig-app-id": env.INSTAGRAM_X_IG_APP_ID,
+    ...(cookie ? { cookie } : {}),
+    ...extra,
+  };
 }
 
 export function isInstagramPostUrl(rawUrl: string) {
@@ -294,15 +260,7 @@ export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[]
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
   for (const child of nodes) {
-    // Mesma prioridade do switch em processMedia() do Smudge: __typename
-    // primeiro (GraphVideo/GraphImage/Sidecar), heurísticas como
-    // fallback apenas quando o typename não veio preenchido.
-    const typename = child.__typename ?? "";
-    const video = /Video/i.test(typename)
-      ? true
-      : /Image/i.test(typename)
-        ? false
-        : Boolean(child.is_video || child.video_url);
+    const video = Boolean(child.is_video || child.video_url || /Video/i.test(child.__typename ?? ""));
     const url = (video ? child.video_url : bestImage(child))
       ?.replace(/\\u0026/gi, "&")
       .replace(/&amp;/gi, "&");
@@ -333,16 +291,11 @@ function fallbackFromMeta(html: string): { items: RemoteMediaItem[]; metadata: M
 }
 
 async function fetchEmbed(code: string): Promise<{ html: string; node?: InstagramNode }> {
-  const session = await getSession().catch(() => undefined);
   const embedUrl = `https://www.instagram.com/p/${code}/embed/captioned/`;
   const response = await fetch(embedUrl, {
     redirect: "follow",
     signal: AbortSignal.timeout(12_000),
-    headers: {
-      ...instagramHeaders,
-      referer: "https://www.instagram.com/",
-      ...(session?.cookie ? { cookie: session.cookie } : {}),
-    },
+    headers: requestHeaders({ referer: "https://www.instagram.com/" }),
   });
   if (!response.ok) throw new Error(`Embed do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
@@ -350,23 +303,34 @@ async function fetchEmbed(code: string): Promise<{ html: string; node?: Instagra
 }
 
 async function fetchPublicPage(code: string): Promise<{ html: string; node?: InstagramNode }> {
-  const session = await getSession().catch(() => undefined);
   const response = await fetch(`https://www.instagram.com/p/${code}/`, {
     redirect: "follow",
     signal: AbortSignal.timeout(12_000),
-    headers: {
-      ...instagramHeaders,
-      referer: "https://www.instagram.com/",
-      ...(session?.cookie ? { cookie: session.cookie } : {}),
-    },
+    headers: requestHeaders({ referer: "https://www.instagram.com/" }),
   });
   if (!response.ok) throw new Error(`Página do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
   return { html, node: extractInstagramGqlData(html) ?? extractInstagramSingleImage(html)?.node };
 }
 
+async function fetchScraper(code: string): Promise<InstagramNode | undefined> {
+  if (!env.INSTAGRAM_SCRAPER_URL) return undefined;
+  const endpoint = new URL(env.INSTAGRAM_SCRAPER_URL);
+  endpoint.searchParams.set("id", code);
+  const response = await fetch(endpoint, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(15_000),
+    headers: requestHeaders({ accept: "application/json" }),
+  });
+  if (!response.ok) throw new Error(`Scraper do Instagram respondeu HTTP ${response.status}`);
+  const payload = await response.json() as InstagramEnvelope;
+  return payload.shortcode_media
+    ?? payload.data?.xdt_shortcode_media
+    ?? payload.xdt_shortcode_media
+    ?? deepFindMediaNode(payload);
+}
+
 async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
-  const session = await getSession().catch(() => undefined);
   const body = new URLSearchParams({
     variables: JSON.stringify({
       shortcode: code,
@@ -379,20 +343,14 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
   const response = await fetch("https://www.instagram.com/graphql/query", {
     method: "POST",
     signal: AbortSignal.timeout(12_000),
-    headers: {
-      ...instagramHeaders,
+    headers: requestHeaders({
       "content-type": "application/x-www-form-urlencoded",
-      // O Instagram valida que este header bate com o cookie "csrftoken" da
-      // sessão; um valor estático desatualizado faz o GraphQL rejeitar a
-      // requisição silenciosamente (200 OK com corpo vazio/erro).
-      "x-csrftoken": session?.csrfToken ?? "JKA19cNYckTn_Dr6bcTO5F",
-      "x-ig-app-id": "936619743392459",
+      "x-csrftoken": instagramCsrfToken() ?? "",
       "x-fb-lsd": "AVqBX1zadbA",
       "sec-fetch-site": "same-origin",
       origin: "https://www.instagram.com",
       referer: `https://www.instagram.com/p/${code}/`,
-      ...(session?.cookie ? { cookie: session.cookie } : {}),
-    },
+    }),
     body,
   });
   if (!response.ok) return undefined;
@@ -416,6 +374,10 @@ export async function downloadInstagramMedia(rawUrl: string): Promise<Downloaded
     node = embed.node;
   } catch {
     // Continua para os outros caminhos.
+  }
+
+  if (!node && env.INSTAGRAM_SCRAPER_URL) {
+    node = await fetchScraper(code).catch(() => undefined);
   }
 
   if (!node) {

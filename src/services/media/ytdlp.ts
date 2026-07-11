@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { execa } from "execa";
@@ -8,10 +8,12 @@ import type { DownloadedMedia, DownloadMode, MediaMetadata, RemoteMediaItem } fr
 import { downloadWithGalleryDl } from "./gallerydl.js";
 import { downloadInstagramMedia, isInstagramPostUrl } from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
+import { cookieFileForUrl } from "./cookies.js";
 
 interface FormatInfo {
   url?: string;
   ext?: string;
+  video_ext?: string;
   protocol?: string;
   vcodec?: string;
   acodec?: string;
@@ -20,6 +22,7 @@ interface FormatInfo {
   tbr?: number;
   filesize?: number;
   filesize_approx?: number;
+  http_headers?: Record<string, string>;
 }
 
 interface ThumbnailInfo {
@@ -29,6 +32,7 @@ interface ThumbnailInfo {
 }
 
 interface Info {
+  _type?: string;
   id?: string;
   title?: string;
   description?: string;
@@ -42,16 +46,16 @@ interface Info {
   extractor_key?: string;
   extractor?: string;
   ext?: string;
+  video_ext?: string;
   url?: string;
   width?: number;
   height?: number;
   is_live?: boolean;
   formats?: FormatInfo[];
   thumbnails?: ThumbnailInfo[];
+  http_headers?: Record<string, string>;
   entries?: Array<Info | null>;
 }
-
-let cookiePromise: Promise<string | undefined> | undefined;
 
 function flattenEntries(info: Info): Info[] {
   const output: Info[] = [];
@@ -83,18 +87,30 @@ function imageUrl(entry: Info) {
   return bestThumbnail(entry);
 }
 
+function isImageExtension(value?: string) {
+  return /^(?:jpe?g|png|webp|gif|avif)$/i.test(value ?? "");
+}
+
+function isVideoExtension(value?: string) {
+  return /^(?:mp4|m4v|mov|webm|mkv)$/i.test(value ?? "");
+}
+
 function videoFormats(entry: Info) {
   const maxBytes = env.MAX_UPLOAD_BYTES;
   return [...(entry.formats ?? [])]
-    .filter((format) => Boolean(format.url) && format.vcodec && format.vcodec !== "none")
+    .filter((format) => Boolean(format.url))
+    // O extrator do Instagram nem sempre preenche vcodec/video_ext nas
+    // variantes retornadas por video_versions. Ausência não significa áudio.
+    .filter((format) => format.vcodec !== "none")
+    .filter((format) => !isImageExtension(format.ext ?? format.video_ext))
     .filter((format) => !format.height || format.height <= 1080)
     .filter((format) => {
       const size = format.filesize ?? format.filesize_approx;
       return !size || size <= maxBytes;
     })
     .sort((a, b) => {
-      const mp4A = a.ext === "mp4" ? 1 : 0;
-      const mp4B = b.ext === "mp4" ? 1 : 0;
+      const mp4A = (a.ext === "mp4" || a.video_ext === "mp4") ? 1 : 0;
+      const mp4B = (b.ext === "mp4" || b.video_ext === "mp4") ? 1 : 0;
       return mp4B - mp4A
         || (b.height ?? 0) - (a.height ?? 0)
         || (b.tbr ?? 0) - (a.tbr ?? 0);
@@ -108,17 +124,18 @@ function videoFormats(entry: Info) {
 export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
-  const imageExt = /^(?:jpe?g|png|webp|gif|heic)$/i;
   for (const entry of flattenEntries(info)) {
-    // Alguns posts de foto do Instagram fazem o yt-dlp devolver um "formats"
-    // com vcodec preenchido mesmo sem haver vídeo de fato (ex.: preview
-    // sintético gerado pela Meta). Se o próprio yt-dlp já classificou a
-    // extensão do item como imagem, confiamos nisso antes de tratar como
-    // vídeo — mesma prioridade de __typename usada no extrator direto.
-    const isDeclaredImage = imageExt.test(entry.ext ?? "");
-    const formats = isDeclaredImage ? [] : videoFormats(entry);
-    if (formats.length) {
-      const urls = formats.map((format) => format.url!).filter((url, index, all) => all.indexOf(url) === index);
+    const formats = videoFormats(entry);
+    const directVideo = entry.url
+      && entry._type !== "url"
+      && (isVideoExtension(entry.ext ?? entry.video_ext) || /\.(?:mp4|m4v|mov|webm)(?:$|[?#])/i.test(entry.url))
+      ? entry.url
+      : undefined;
+
+    if (formats.length || directVideo) {
+      const urls = [directVideo, ...formats.map((format) => format.url)]
+        .filter((url): url is string => Boolean(url))
+        .filter((url, index, all) => all.indexOf(url) === index);
       const url = urls.shift();
       if (url && !seen.has(url)) {
         seen.add(url);
@@ -145,73 +162,79 @@ export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
 }
 
 async function probeInstagramRemoteMedia(url: string): Promise<DownloadedMedia> {
-  const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-instagram-meta-"));
+  const args = [
+    ...await common(url),
+    "--ignore-errors",
+    // Essencial para posts/carrosséis de foto: o Instagram extractor do
+    // yt-dlp representa imagens como entries sem formatos de vídeo.
+    "--ignore-no-formats-error",
+    "--skip-download",
+    "--yes-playlist",
+    "--no-flat-playlist",
+    "--playlist-end", String(env.MAX_MEDIA_ITEMS),
+    "--dump-single-json",
+    url,
+  ];
+
+  let stdout = "";
+  let commandError: unknown;
   try {
-    const template = join(directory, "%(playlist_index|)s%(id)s-%(title).80B.%(ext)s");
-    let commandError: unknown;
-    try {
-      await execa(env.YTDLP_BINARY, [
-        ...await common(),
-        "--ignore-errors",
-        "--skip-download",
-        "--yes-playlist",
-        "--playlist-end", String(env.MAX_MEDIA_ITEMS),
-        "--restrict-filenames",
-        "--trim-filenames", "120",
-        "--output", template,
-        "--write-info-json",
-        "--write-playlist-metafiles",
-        url,
-      ], {
-        timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 30_000),
-        maxBuffer: 50 * 1024 * 1024,
-      });
-    } catch (error) {
-      // O yt-dlp pode encerrar com código 1 após escrever o JSON da playlist
-      // quando os itens são fotos. O SmudgeLord usa esses URLs diretamente,
-      // então ainda tentamos aproveitar os metadados gerados.
-      commandError = error;
+    const result = await execa(env.YTDLP_BINARY, args, {
+      timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 45_000),
+      maxBuffer: 80 * 1024 * 1024,
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    commandError = error;
+    if (error && typeof error === "object" && "stdout" in error && typeof (error as { stdout?: unknown }).stdout === "string") {
+      stdout = (error as { stdout: string }).stdout;
     }
-
-    const paths = await walk(directory);
-    const jsonPaths = paths.filter((path) => path.endsWith(".info.json"));
-    const parsed: Info[] = [];
-    for (const path of jsonPaths) {
-      try { parsed.push(JSON.parse(await readFile(path, "utf8")) as Info); } catch { /* ignora JSON parcial */ }
-    }
-    const info = parsed.find((item) => item.entries?.length) ?? parsed[0];
-    if (!info) {
-      if (commandError) throw commandError;
-      throw new Error("yt-dlp não gerou metadados do Instagram");
-    }
-
-    const remoteItems = instagramRemoteItemsFromInfo(info);
-    if (!remoteItems.length) throw new Error("yt-dlp não retornou fotos ou vídeos do Instagram");
-    return {
-      files: [],
-      remoteItems,
-      metadata: {
-        ...metadata(info, url),
-        extractor: "instagram-ytdlp-metadata",
-      },
-    };
-  } finally {
-    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }
+
+  const trimmed = stdout.trim();
+  let info: Info | undefined;
+  if (trimmed) {
+    try {
+      info = JSON.parse(trimmed) as Info;
+    } catch {
+      // Algumas builds podem misturar uma linha informativa no stdout. O JSON
+      // de --dump-single-json é o último objeto completo emitido.
+      const first = trimmed.indexOf("{");
+      const last = trimmed.lastIndexOf("}");
+      if (first >= 0 && last > first) {
+        try { info = JSON.parse(trimmed.slice(first, last + 1)) as Info; } catch { /* tratado abaixo */ }
+      }
+    }
+  }
+
+  if (!info) {
+    if (commandError) throw commandError;
+    throw new Error("yt-dlp não gerou JSON do Instagram");
+  }
+
+  const remoteItems = instagramRemoteItemsFromInfo(info);
+  if (!remoteItems.length) {
+    throw new Error(`yt-dlp retornou ${flattenEntries(info).length} itens, mas nenhuma foto ou vídeo utilizável`);
+  }
+
+  logger.info({
+    url,
+    entries: flattenEntries(info).length,
+    photos: remoteItems.filter((item) => item.kind === "photo").length,
+    videos: remoteItems.filter((item) => item.kind === "video").length,
+  }, "Instagram extraído por metadados do yt-dlp");
+
+  return {
+    files: [],
+    remoteItems,
+    metadata: {
+      ...metadata(info, url),
+      extractor: "instagram-ytdlp-json",
+    },
+  };
 }
 
-async function cookieFile() {
-  const b64 = env.YTDLP_COOKIES_B64;
-  if (!b64) return undefined;
-  cookiePromise ??= (async () => {
-    const path = join(tmpdir(), "esqueletops-nova-cookies.txt");
-    await writeFile(path, Buffer.from(b64, "base64"), { mode: 0o600 });
-    return path;
-  })();
-  return cookiePromise;
-}
-
-async function common() {
+async function common(url: string) {
   const args = [
     "--no-warnings",
     "--no-progress",
@@ -221,8 +244,9 @@ async function common() {
     "--socket-timeout", "20",
     "--concurrent-fragments", "4",
     "--no-check-certificates",
+    "--js-runtimes", "node",
   ];
-  const cookies = await cookieFile();
+  const cookies = await cookieFileForUrl(url);
   if (cookies) args.push("--cookies", cookies);
   if (env.YTDLP_PROXY) args.push("--proxy", env.YTDLP_PROXY);
   return args;
@@ -231,21 +255,21 @@ async function common() {
 function metadata(info: Info, url: string): MediaMetadata {
   const source = info.entries?.find(Boolean) ?? info;
   return {
-    id: source.id,
-    title: source.title,
-    description: source.description,
-    uploader: source.uploader ?? source.channel,
-    uploaderId: source.uploader_id,
-    duration: source.duration,
-    webpageUrl: source.webpage_url ?? info.webpage_url ?? info.original_url ?? url,
-    thumbnail: source.thumbnail,
-    extractor: source.extractor_key ?? source.extractor,
+    id: info.id ?? source.id,
+    title: info.title ?? source.title,
+    description: info.description ?? source.description,
+    uploader: info.uploader ?? info.channel ?? source.uploader ?? source.channel,
+    uploaderId: info.uploader_id ?? source.uploader_id,
+    duration: info.duration ?? source.duration,
+    webpageUrl: info.webpage_url ?? source.webpage_url ?? info.original_url ?? url,
+    thumbnail: info.thumbnail ?? source.thumbnail,
+    extractor: info.extractor_key ?? info.extractor ?? source.extractor_key ?? source.extractor,
   };
 }
 
 export async function probeMedia(url: string) {
   const result = await execa(env.YTDLP_BINARY, [
-    ...await common(),
+    ...await common(url),
     "--dump-single-json",
     "--skip-download",
     "--playlist-end", "1",
@@ -271,8 +295,9 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<Downl
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-media-"));
   try {
     const template = join(directory, "%(playlist_index|)s%(id)s-%(title).80B.%(ext)s");
+    const instagram = isInstagramPostUrl(url) && mode !== "audio";
     const args = [
-      ...await common(),
+      ...await common(url),
       "--yes-playlist",
       "--playlist-end", String(env.MAX_MEDIA_ITEMS),
       "--restrict-filenames",
@@ -281,40 +306,103 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<Downl
       "--write-info-json",
       "--max-filesize", `${Math.ceil(env.MAX_UPLOAD_MB * 2)}M`,
     ];
+
     if (mode === "audio") {
-      args.push("--extract-audio", "--audio-format", "mp3", "--audio-quality", "0");
-    } else {
       args.push(
-        "--format",
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/best",
+        "--no-playlist",
+        "--format", "ba[ext=m4a]/ba/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+      );
+    } else if (mode === "video") {
+      args.push(
+        "--no-playlist",
+        "--format", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/best[height<=1080]/best",
         "--merge-output-format", "mp4",
       );
+    } else {
+      // No modo automático não forçamos um formato de vídeo. Essa era a causa
+      // de fotos/carrosséis serem tratados como vídeo e descartados.
+      args.push(
+        "--ignore-errors",
+        "--ignore-no-formats-error",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+      );
     }
+
+    if (instagram) {
+      // Mantém as imagens de cada slide mesmo quando o extrator informa que
+      // não há formatos de vídeo.
+      args.push("--ignore-errors", "--ignore-no-formats-error", "--write-thumbnail", "--convert-thumbnails", "jpg");
+    }
+
     args.push(url);
     logger.debug({ url, mode }, "yt-dlp");
-    await execa(env.YTDLP_BINARY, args, {
-      timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000,
-      maxBuffer: 50 * 1024 * 1024,
-    });
+
+    let commandError: unknown;
+    try {
+      await execa(env.YTDLP_BINARY, args, {
+        timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000,
+        maxBuffer: 80 * 1024 * 1024,
+      });
+    } catch (error) {
+      // Alguns extratores encerram com código 1 mesmo depois de gravar fotos
+      // e metadados válidos. Inspecionamos o diretório antes de desistir.
+      commandError = error;
+    }
 
     const all = await walk(directory);
     let mediaMetadata: MediaMetadata = { webpageUrl: url };
-    const info = all.find((path) => path.endsWith(".info.json"));
-    if (info) {
-      try { mediaMetadata = metadata(JSON.parse(await readFile(info, "utf8")) as Info, url); } catch { /* ignore */ }
-    } else {
-      try { mediaMetadata = await probeMedia(url); } catch { /* ignore */ }
+    const jsonFiles = all.filter((path) => path.endsWith(".info.json"));
+    for (const infoPath of jsonFiles) {
+      try {
+        const parsed = JSON.parse(await readFile(infoPath, "utf8")) as Info;
+        mediaMetadata = metadata(parsed, url);
+        if (parsed.entries?.length) break;
+      } catch {
+        // ignora JSON parcial
+      }
     }
+    if (!jsonFiles.length) {
+      try { mediaMetadata = await probeMedia(url); } catch { /* ignora */ }
+    }
+
     const ignored = new Set([".json", ".part", ".ytdl", ".temp"]);
     const files: string[] = [];
     for (const path of all) {
       if (path.endsWith(".info.json") || ignored.has(extname(path).toLowerCase())) continue;
-      const info = await stat(path);
-      if (info.isFile() && info.size > 0) files.push(path);
+      const fileInfo = await stat(path);
+      if (fileInfo.isFile() && fileInfo.size > 0) files.push(path);
     }
     files.sort((a, b) => basename(a).localeCompare(basename(b), undefined, { numeric: true }));
-    if (!files.length) throw new Error("yt-dlp não encontrou mídia utilizável");
-    return { directory, files: files.slice(0, env.MAX_MEDIA_ITEMS), metadata: mediaMetadata };
+
+    // Se um item possui vídeo e thumbnail com o mesmo nome-base, a thumbnail
+    // é apenas capa e não deve virar uma foto extra no álbum.
+    const videoExtensions = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv"]);
+    const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif"]);
+    const stemsWithVideo = new Set(
+      files
+        .filter((path) => videoExtensions.has(extname(path).toLowerCase()))
+        .map((path) => path.slice(0, -extname(path).length).replace(/\.(?:webp|jpg|jpeg|png)$/i, "")),
+    );
+    const usableFiles = files.filter((path) => {
+      const extension = extname(path).toLowerCase();
+      if (!imageExtensions.has(extension)) return true;
+      const stem = path.slice(0, -extension.length).replace(/\.(?:webp|jpg|jpeg|png)$/i, "");
+      return !stemsWithVideo.has(stem);
+    });
+
+    if (!usableFiles.length) {
+      if (commandError) throw commandError;
+      throw new Error("yt-dlp não encontrou mídia utilizável");
+    }
+    return {
+      directory,
+      files: usableFiles.slice(0, env.MAX_MEDIA_ITEMS),
+      metadata: mediaMetadata,
+    };
   } catch (error) {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
@@ -331,19 +419,21 @@ export async function downloadMedia(url: string, mode: DownloadMode): Promise<Do
   const instagram = mode !== "audio" && isInstagramPostUrl(url);
   const extractorErrors: unknown[] = [];
   if (instagram) {
+    // Mesma prioridade do SmudgeLord: embed/scraper/GraphQL primeiro. O JSON
+    // do yt-dlp é apenas fallback para imagens e carrosséis.
     if (env.INSTAGRAM_EMBED_ENABLED) {
       try {
         return await downloadInstagramMedia(url);
       } catch (error) {
         extractorErrors.push(error);
-        logger.info({ url, error }, "Extração direta do Instagram indisponível; tentando metadados do yt-dlp");
+        logger.info({ url, error }, "Extração do Instagram no fluxo Smudge indisponível; tentando metadados do yt-dlp");
       }
     }
     try {
       return await probeInstagramRemoteMedia(url);
     } catch (error) {
       extractorErrors.push(error);
-      logger.info({ url, error }, "Metadados do Instagram indisponíveis; tentando download convencional");
+      logger.info({ url, error }, "Metadados completos do Instagram indisponíveis; tentando fallback convencional");
     }
   }
 

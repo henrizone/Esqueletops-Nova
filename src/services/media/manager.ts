@@ -1,49 +1,51 @@
 import { rm } from "node:fs/promises";
+import { cacheGetJson, cacheSetJson, consumeCooldown } from "../../cache/redis.js";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
-import { cacheGetJson, cacheSetJson, consumeCooldown } from "../../cache/redis.js";
+import type { BotContext } from "../../types/context.js";
 import { errorCode, errorMessage } from "../../utils/errors.js";
 import { escapeHtml, truncate } from "../../utils/html.js";
-import type { BotContext } from "../../types/context.js";
 import { buildMediaCaption } from "./caption.js";
 import { prepareMediaFiles } from "./convert.js";
 import { materializeRemoteItems } from "./direct.js";
-import { sendCachedMedia, sendPreparedMedia, sendRemoteMedia, sendTextPost } from "./sender.js";
-import type { CachedMediaPayload, DownloadRequest } from "./types.js";
+import { sendCachedMedia, sendPreparedMedia, sendTextPost } from "./sender.js";
+import type { CachedMediaPayload, DownloadRequest, PreparedMediaItem } from "./types.js";
 import { mediaCacheKey } from "./urls.js";
 import { downloadMedia } from "./ytdlp.js";
 
 async function logFailure(ctx: BotContext, code: string, request: DownloadRequest, error: unknown) {
   logger.error({ code, error, request }, "Falha no download");
   if (!env.LOG_CHANNEL_ID) return;
-  await ctx.api.sendMessage(env.LOG_CHANNEL_ID,
+  await ctx.api.sendMessage(
+    env.LOG_CHANNEL_ID,
     `<b>DOWNLOAD ${code}</b>\nURL: <code>${escapeHtml(truncate(request.url, 1500))}</code>\nErro: <code>${escapeHtml(truncate(errorMessage(error), 2000))}</code>`,
     { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   ).catch(() => undefined);
 }
 
-async function sendActivity(ctx: BotContext, request: DownloadRequest) {
-  // Mesmo indicador do Smudge (sendMediaAndHandleCaption -> chatActionUploadDoc):
-  // "upload_document" é o padrão genérico pra links (foto, vídeo ou álbum
-  // misto). "upload_video" no Smudge só aparece no fluxo específico do botão
-  // inline do YouTube, não no download automático por link.
-  const action = request.mode === "audio" ? "upload_voice" : "upload_document";
-  await ctx.api.sendChatAction(request.chatId, action).catch(() => undefined);
+function activityFor(items: PreparedMediaItem[]) {
+  if (items.some((item) => item.kind === "video")) return "upload_video" as const;
+  if (items.some((item) => item.kind === "photo")) return "upload_photo" as const;
+  if (items.some((item) => item.kind === "audio")) return "upload_voice" as const;
+  return "upload_document" as const;
 }
 
 /**
- * Fluxo simples, inspirado no SmudgeLord:
- * cache -> extrator direto -> envio em streaming -> fallback yt-dlp/FFmpeg.
- * Não existe fila global nem lock de mídia no Redis, portanto um download
- * lento não bloqueia todos os links seguintes.
+ * Fluxo equivalente ao SmudgeLord:
+ * cache -> extrator específico -> baixa cada arquivo com o tipo correto ->
+ * envia como foto, vídeo, áudio ou documento. FFmpeg só entra quando o arquivo
+ * realmente precisa ser convertido.
  */
 export async function processDownload(ctx: BotContext, request: DownloadRequest): Promise<boolean> {
   const startedAt = Date.now();
+  const directories = new Set<string>();
   const cooldown = env.DOWNLOAD_COOLDOWN_SECONDS > 0
     ? await consumeCooldown(`download:${request.requesterId}`, env.DOWNLOAD_COOLDOWN_SECONDS).catch(() => 0)
     : 0;
   if (cooldown > 0) {
-    if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadCooldown", { seconds: cooldown }), { parse_mode: "HTML" });
+    if (request.errorMessagesEnabled) {
+      await ctx.reply(ctx.t("downloadCooldown", { seconds: cooldown }), { parse_mode: "HTML" });
+    }
     return false;
   }
 
@@ -60,13 +62,12 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     }
   }
 
-  await sendActivity(ctx, request);
+  await ctx.api.sendChatAction(request.chatId, "typing").catch(() => undefined);
   logger.info({ url: request.url, mode: request.mode, automatic: request.automatic }, "Processando mídia");
 
-  let directory: string | undefined;
   try {
     const downloaded = await downloadMedia(request.url, request.mode);
-    directory = downloaded.directory;
+    if (downloaded.directory) directories.add(downloaded.directory);
     const metadata = {
       ...downloaded.metadata,
       webpageUrl: downloaded.metadata.webpageUrl ?? request.url,
@@ -78,25 +79,21 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     }
 
     const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
-    let items = [] as CachedMediaPayload["items"];
+    let prepared: PreparedMediaItem[] = [];
 
     if (downloaded.remoteItems?.length) {
-      try {
-        items = await sendRemoteMedia(ctx, downloaded.remoteItems, caption, request.replyToMessageId, request.url);
-      } catch (streamError) {
-        logger.warn({ error: streamError, url: request.url }, "Streaming direto falhou; usando fallback local");
-        const local = await materializeRemoteItems(downloaded.remoteItems, request.url);
-        directory = local.directory;
-        const prepared = await prepareMediaFiles(local.files);
-        if (!prepared.length) throw streamError;
-        items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId, request.url);
-      }
+      // O SmudgeLord baixa as mídias antes de enviá-las. Isso preserva o tipo
+      // real e evita travamentos do Telegram ao buscar CDNs com referer.
+      const local = await materializeRemoteItems(downloaded.remoteItems, request.url);
+      directories.add(local.directory);
+      prepared = await prepareMediaFiles(local.files);
     } else if (downloaded.files.length) {
-      const prepared = await prepareMediaFiles(downloaded.files);
-      if (!prepared.length) {
-        if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadNoMedia"), { parse_mode: "HTML" });
-        return false;
-      }
+      prepared = await prepareMediaFiles(downloaded.files);
+    }
+
+    let items: CachedMediaPayload["items"] = [];
+    if (prepared.length) {
+      await ctx.api.sendChatAction(request.chatId, activityFor(prepared)).catch(() => undefined);
       items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId, request.url);
     } else if (metadata.captionHtml) {
       await sendTextPost(ctx, caption, request.replyToMessageId, request.url);
@@ -120,7 +117,8 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     logger.info({
       url: request.url,
       durationMs: Date.now() - startedAt,
-      mediaCount: downloaded.remoteItems?.length ?? downloaded.files.length,
+      mediaCount: prepared.length,
+      mediaKinds: prepared.map((item) => item.kind),
       extractor: metadata.extractor,
     }, "Mídia enviada");
     return true;
@@ -132,6 +130,8 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     }
     return false;
   } finally {
-    if (directory && env.DELETE_TEMP_FILES) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    if (env.DELETE_TEMP_FILES) {
+      await Promise.all([...directories].map((directory) => rm(directory, { recursive: true, force: true }).catch(() => undefined)));
+    }
   }
 }
