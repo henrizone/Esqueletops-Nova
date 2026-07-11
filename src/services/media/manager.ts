@@ -35,7 +35,7 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
   if (cached?.items.length) {
     const caption = request.captionEnabled ? buildMediaCaption(cached.metadata, request.url) : "";
     try {
-      await sendCachedMedia(ctx, cached, caption, request.replyToMessageId);
+      await sendCachedMedia(ctx, cached, caption, request.replyToMessageId, request.url);
       return true;
     } catch (error) {
       logger.warn({ error, key }, "Cache de file_id inválido; baixando novamente");
@@ -60,23 +60,33 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     return await queue.add(async () => {
       let directory: string | undefined;
       try {
-        const metadata = await probeMedia(request.url);
+        let probedMetadata;
+        try {
+          probedMetadata = await probeMedia(request.url);
+        } catch (error) {
+          logger.info({ url: request.url, error }, "Prévia do yt-dlp indisponível; o download tentará os extratores de fallback");
+        }
         const limit = request.automatic ? env.MAX_AUTO_DURATION_SECONDS : env.MAX_FORCE_DURATION_SECONDS;
-        if (metadata.duration && metadata.duration > limit) {
+        if (probedMetadata?.duration && probedMetadata.duration > limit) {
           if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadTooLong"), { parse_mode: "HTML" });
           return false;
         }
         const downloaded = await downloadMedia(request.url, request.mode);
         directory = downloaded.directory;
+        const metadata = { ...downloaded.metadata, ...probedMetadata, webpageUrl: probedMetadata?.webpageUrl ?? downloaded.metadata.webpageUrl ?? request.url };
+        if (metadata.duration && metadata.duration > limit) {
+          if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadTooLong"), { parse_mode: "HTML" });
+          return false;
+        }
         const prepared = await prepareMediaFiles(downloaded.files);
         if (!prepared.length) {
           if (request.errorMessagesEnabled) await ctx.reply(ctx.t("downloadNoMedia"), { parse_mode: "HTML" });
           return false;
         }
-        const caption = request.captionEnabled ? buildMediaCaption(downloaded.metadata, request.url) : "";
-        const items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId);
+        const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
+        const items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId, request.url);
         if (items.length) {
-          await cacheSetJson(`media:${key}`, { items, metadata: downloaded.metadata, cachedAt: new Date().toISOString() } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
+          await cacheSetJson(`media:${key}`, { items, metadata, cachedAt: new Date().toISOString() } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
         }
         if (request.deleteSource && request.sourceMessageId && ctx.chat) {
           await ctx.api.deleteMessage(ctx.chat.id, request.sourceMessageId).catch(() => undefined);

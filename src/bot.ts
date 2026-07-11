@@ -1,6 +1,7 @@
 import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot } from "grammy";
 import { env } from "./config/env.js";
+import { logger } from "./config/logger.js";
 import { afkMiddleware, registerAfkModule } from "./modules/afk.js";
 import { registerConfigModule } from "./modules/config.js";
 import { registerInlineModule } from "./modules/inline.js";
@@ -16,6 +17,28 @@ import type { BotContext } from "./types/context.js";
 
 export const bot = new Bot<BotContext>(env.TELEGRAM_TOKEN, { client: { apiRoot: env.BOT_API_URL } });
 bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 30 }));
+
+bot.use(async (ctx, next) => {
+  const startedAt = Date.now();
+  try {
+    await next();
+  } finally {
+    const text = ctx.message?.text ?? ctx.message?.caption ?? "";
+    const command = text.startsWith("/") ? text.split(/\s+/, 1)[0] : undefined;
+    const important = Boolean(command || ctx.callbackQuery || ctx.inlineQuery);
+    const data = {
+      updateId: ctx.update.update_id,
+      chatId: ctx.chat?.id,
+      userId: ctx.from?.id,
+      command,
+      callback: ctx.callbackQuery?.data,
+      inline: Boolean(ctx.inlineQuery),
+      durationMs: Date.now() - startedAt,
+    };
+    if (important) logger.info(data, "Atualização do Telegram processada");
+    else logger.debug(data, "Atualização do Telegram processada");
+  }
+});
 
 bot.use(contextMiddleware);
 bot.use(disabledCommandsMiddleware);

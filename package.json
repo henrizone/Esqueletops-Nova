@@ -1,11 +1,13 @@
 {
   "name": "esqueletops-nova",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Esqueletops • Nova — bot multifunções para Telegram em TypeScript",
   "license": "GPL-3.0-only",
-  "engines": { "node": ">=24.0.0" },
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",

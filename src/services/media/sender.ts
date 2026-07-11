@@ -1,7 +1,9 @@
 import { InputFile, InputMediaBuilder } from "grammy";
 import type { Message } from "grammy/types";
+import { env } from "../../config/env.js";
 import type { BotContext } from "../../types/context.js";
 import type { CachedMediaItem, CachedMediaPayload, PreparedMediaItem } from "./types.js";
+import { sourceKeyboard } from "./source-button.js";
 
 function replyParams(replyToMessageId?: number) {
   return replyToMessageId ? { reply_parameters: { message_id: replyToMessageId } } : {};
@@ -20,11 +22,14 @@ async function sendOne(
   item: PreparedMediaItem | CachedMediaItem,
   caption: string,
   replyToMessageId?: number,
+  sourceUrl?: string,
 ): Promise<Message> {
   const media = "path" in item ? new InputFile(item.path, item.filename) : item.fileId;
+  const replyMarkup = env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined;
   const common = {
     caption: caption || undefined,
     parse_mode: "HTML" as const,
+    reply_markup: replyMarkup,
     ...replyParams(replyToMessageId),
   };
   switch (item.kind) {
@@ -41,17 +46,36 @@ function chunks<T>(items: T[], size: number): T[][] {
   return result;
 }
 
+async function sendAlbumSourceButton(ctx: BotContext, sourceUrl: string | undefined, replyToMessageId?: number) {
+  if (!env.MEDIA_SOURCE_BUTTON || !sourceUrl) return;
+  const keyboard = sourceKeyboard(sourceUrl);
+  if (!keyboard) return;
+  // sendMediaGroup não aceita reply_markup. Para álbuns, o botão fica em uma
+  // mensagem compacta logo abaixo, respondendo à primeira mídia do álbum.
+  await ctx.reply("🔗", {
+    reply_markup: keyboard,
+    ...replyParams(replyToMessageId),
+  });
+}
+
 export async function sendPreparedMedia(
   ctx: BotContext,
   items: PreparedMediaItem[],
   caption: string,
   replyToMessageId?: number,
+  sourceUrl?: string,
 ): Promise<CachedMediaItem[]> {
   if (items.some((item) => item.kind === "audio" || item.kind === "document")) {
     const cached: CachedMediaItem[] = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index]!;
-      const message = await sendOne(ctx, item, index === 0 ? caption : "", index === 0 ? replyToMessageId : undefined);
+      const message = await sendOne(
+        ctx,
+        item,
+        index === 0 ? caption : "",
+        index === 0 ? replyToMessageId : undefined,
+        index === 0 ? sourceUrl : undefined,
+      );
       const fileId = fileIdFromMessage(message, item.kind);
       if (fileId) cached.push({ kind: item.kind, fileId, filename: item.filename });
     }
@@ -60,21 +84,35 @@ export async function sendPreparedMedia(
 
   const cached: CachedMediaItem[] = [];
   let globalIndex = 0;
+  let firstAlbumMessageId: number | undefined;
+  let usedMediaGroup = false;
+  let sourceButtonAttached = false;
   for (const groupItems of chunks(items, 10)) {
     if (groupItems.length === 1) {
       const item = groupItems[0]!;
-      const message = await sendOne(ctx, item, globalIndex === 0 ? caption : "", globalIndex === 0 ? replyToMessageId : undefined);
+      const message = await sendOne(
+        ctx,
+        item,
+        globalIndex === 0 ? caption : "",
+        globalIndex === 0 ? replyToMessageId : undefined,
+        sourceUrl,
+      );
+      sourceButtonAttached = Boolean(sourceUrl);
       const fileId = fileIdFromMessage(message, item.kind);
       if (fileId) cached.push({ kind: item.kind, fileId, filename: item.filename });
       globalIndex += 1;
       continue;
     }
+    usedMediaGroup = true;
     const group = groupItems.map((item, index) => {
       const media = new InputFile(item.path, item.filename);
       const options = globalIndex === 0 && index === 0 && caption ? { caption, parse_mode: "HTML" as const } : undefined;
-      return item.kind === "photo" ? InputMediaBuilder.photo(media, options) : InputMediaBuilder.video(media, { ...options, supports_streaming: true });
+      return item.kind === "photo"
+        ? InputMediaBuilder.photo(media, options)
+        : InputMediaBuilder.video(media, { ...options, supports_streaming: true });
     });
     const messages = await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
+    firstAlbumMessageId ??= messages[0]?.message_id;
     messages.forEach((message, index) => {
       const item = groupItems[index];
       if (!item) return;
@@ -83,6 +121,7 @@ export async function sendPreparedMedia(
     });
     globalIndex += groupItems.length;
   }
+  if (usedMediaGroup && !sourceButtonAttached) await sendAlbumSourceButton(ctx, sourceUrl, firstAlbumMessageId);
   return cached;
 }
 
@@ -91,26 +130,48 @@ export async function sendCachedMedia(
   payload: CachedMediaPayload,
   caption: string,
   replyToMessageId?: number,
+  sourceUrl?: string,
 ): Promise<void> {
   if (payload.items.some((item) => item.kind === "audio" || item.kind === "document")) {
     for (let index = 0; index < payload.items.length; index += 1) {
-      await sendOne(ctx, payload.items[index]!, index === 0 ? caption : "", index === 0 ? replyToMessageId : undefined);
+      await sendOne(
+        ctx,
+        payload.items[index]!,
+        index === 0 ? caption : "",
+        index === 0 ? replyToMessageId : undefined,
+        index === 0 ? sourceUrl : undefined,
+      );
     }
     return;
   }
 
   let globalIndex = 0;
+  let firstAlbumMessageId: number | undefined;
+  let usedMediaGroup = false;
+  let sourceButtonAttached = false;
   for (const groupItems of chunks(payload.items, 10)) {
     if (groupItems.length === 1) {
-      await sendOne(ctx, groupItems[0]!, globalIndex === 0 ? caption : "", globalIndex === 0 ? replyToMessageId : undefined);
+      await sendOne(
+        ctx,
+        groupItems[0]!,
+        globalIndex === 0 ? caption : "",
+        globalIndex === 0 ? replyToMessageId : undefined,
+        sourceUrl,
+      );
+      sourceButtonAttached = Boolean(sourceUrl);
       globalIndex += 1;
       continue;
     }
+    usedMediaGroup = true;
     const group = groupItems.map((item, index) => {
       const options = globalIndex === 0 && index === 0 && caption ? { caption, parse_mode: "HTML" as const } : undefined;
-      return item.kind === "photo" ? InputMediaBuilder.photo(item.fileId, options) : InputMediaBuilder.video(item.fileId, { ...options, supports_streaming: true });
+      return item.kind === "photo"
+        ? InputMediaBuilder.photo(item.fileId, options)
+        : InputMediaBuilder.video(item.fileId, { ...options, supports_streaming: true });
     });
-    await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
+    const messages = await ctx.replyWithMediaGroup(group, globalIndex === 0 ? replyParams(replyToMessageId) : {});
+    firstAlbumMessageId ??= messages[0]?.message_id;
     globalIndex += groupItems.length;
   }
+  if (usedMediaGroup && !sourceButtonAttached) await sendAlbumSourceButton(ctx, sourceUrl, firstAlbumMessageId);
 }
