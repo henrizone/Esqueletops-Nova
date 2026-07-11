@@ -182,7 +182,7 @@ async function makeThumbnailFromUrl(url?: string) {
 }
 
 function cacheKey(id: string, mode: YouTubeDownloadMode) {
-  return `youtube:v4:${id}:${mode}`;
+  return `youtube:v5:${id}:${mode}`;
 }
 
 function captionFor(info: YouTubeInfo) {

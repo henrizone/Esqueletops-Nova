@@ -110,5 +110,5 @@ export function normalizeUrl(raw: string) {
 }
 
 export const mediaCacheKey = (url: string, mode: string) => createHash("sha256")
-  .update(`v8.5:${mode}:${normalizeUrl(url)}`)
+  .update(`v8.6:${mode}:${normalizeUrl(url)}`)
   .digest("hex");

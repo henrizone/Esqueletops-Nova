@@ -3,6 +3,7 @@ import { basename, dirname, extname, join, parse } from "node:path";
 import { execa } from "execa";
 import { fileTypeFromFile } from "file-type";
 import sharp from "sharp";
+import PQueue from "p-queue";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { MediaKind, PreparedMediaItem } from "./types.js";
@@ -87,12 +88,16 @@ async function normalizePhoto(input: string) {
   return output;
 }
 
-interface ProbeStream {
+export interface ProbeStream {
   codec_type?: string;
   codec_name?: string;
   width?: number;
   height?: number;
   pix_fmt?: string;
+  sample_aspect_ratio?: string;
+  display_aspect_ratio?: string;
+  tags?: { rotate?: string };
+  side_data_list?: Array<{ rotation?: number }>;
 }
 
 interface ProbeResult {
@@ -106,7 +111,7 @@ interface ProbeResult {
 async function probeMedia(path: string): Promise<ProbeResult> {
   const result = await execa(env.FFPROBE_BINARY, [
     "-v", "error",
-    "-show_entries", "format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt",
+    "-show_entries", "format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio:stream_tags=rotate:stream_side_data=rotation",
     "-of", "json",
     path,
   ], { timeout: 30_000 });
@@ -118,15 +123,48 @@ function durationFromProbe(probe: ProbeResult) {
   return Number.isFinite(value) && value > 0 ? value : 1;
 }
 
+function normalizedRotation(stream: ProbeStream) {
+  const sideDataRotation = stream.side_data_list?.find((item) => Number.isFinite(item.rotation))?.rotation;
+  const raw = sideDataRotation ?? Number(stream.tags?.rotate ?? 0);
+  if (!Number.isFinite(raw)) return 0;
+  return ((Math.round(raw) % 360) + 360) % 360;
+}
+
+function hasSquarePixels(stream: ProbeStream) {
+  const sar = stream.sample_aspect_ratio?.trim();
+  return !sar || sar === "1:1" || sar === "0:1" || sar === "N/A";
+}
+
 /**
- * Mantém a proporção, limita cada lado a 1920 px e força largura/altura pares.
- * O libx264 rejeita dimensões ímpares; o segundo scale evita saídas como 1919 px.
+ * Mantém a proporção real, limita cada lado a 1920 px, força dimensões pares
+ * e pixels quadrados. `setsar=1` evita o vídeo achatado/esticado no iOS.
  */
 export const telegramVideoFilter = [
-  "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease",
-  "scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'",
+  // Primeiro transforma pixels anamórficos em pixels quadrados sem alterar a
+  // proporção visual. Depois aplica apenas redução, nunca esticamento.
+  "scale=w='max(2,trunc(iw*sar/2)*2)':h='max(2,trunc(ih/2)*2)':flags=lanczos",
+  "setsar=1",
+  "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:flags=lanczos",
+  "scale=w='max(2,trunc(iw/2)*2)':h='max(2,trunc(ih/2)*2)':flags=lanczos",
+  "setsar=1",
   "format=yuv420p",
 ].join(",");
+
+export function canFastRemuxVideo(stream: ProbeStream | undefined) {
+  if (!stream) return false;
+  const width = stream.width ?? 0;
+  const height = stream.height ?? 0;
+  return stream.codec_name === "h264"
+    && width > 0
+    && height > 0
+    && width <= 1920
+    && height <= 1920
+    && width % 2 === 0
+    && height % 2 === 0
+    && ["yuv420p", "yuvj420p"].includes(stream.pix_fmt ?? "")
+    && hasSquarePixels(stream)
+    && normalizedRotation(stream) === 0;
+}
 
 function videoOutput(input: string) {
   return normalizedPath(input, "-telegram", TELEGRAM_VIDEO_EXTENSION);
@@ -150,7 +188,12 @@ async function remuxOrCopyVideo(input: string, output: string, audioCodec?: stri
     args.push("-c:a", "copy");
   }
 
-  args.push("-movflags", "+faststart", "-f", "mp4", output);
+  args.push(
+    "-metadata:s:v:0", "rotate=0",
+    "-movflags", "+faststart",
+    "-f", "mp4",
+    output,
+  );
   await execa(env.FFMPEG_BINARY, args, { timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000 });
 }
 
@@ -175,9 +218,12 @@ async function transcodeVideo(input: string, output: string, duration: number) {
     "-maxrate", String(Math.floor(videoBitrate * 1.20)),
     "-bufsize", String(videoBitrate * 2),
     "-pix_fmt", "yuv420p",
+    "-profile:v", "high",
+    "-level:v", "4.1",
     "-tag:v", "avc1",
     "-c:a", "aac",
     "-b:a", "128k",
+    "-metadata:s:v:0", "rotate=0",
     "-movflags", "+faststart",
     "-f", "mp4",
     output,
@@ -199,13 +245,7 @@ async function normalizeVideo(input: string) {
 
   if (!video) throw new Error("Arquivo classificado como vídeo não possui stream de vídeo");
 
-  const dimensionsAreEven = (video.width ?? 0) > 0
-    && (video.height ?? 0) > 0
-    && video.width! % 2 === 0
-    && video.height! % 2 === 0;
-  const pixelFormatIsCompatible = ["yuv420p", "yuvj420p"].includes(video.pix_fmt ?? "");
-
-  if (video.codec_name === "h264" && dimensionsAreEven && pixelFormatIsCompatible) {
+  if (canFastRemuxVideo(video)) {
     try {
       await remuxOrCopyVideo(input, output, audio?.codec_name);
       if (await fileSize(output) <= env.MAX_UPLOAD_BYTES) return output;
@@ -233,57 +273,63 @@ async function convertAudio(input: string) {
   return output;
 }
 
-export async function prepareMediaFiles(paths: string[]): Promise<PreparedMediaItem[]> {
-  const output: PreparedMediaItem[] = [];
+async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem | undefined> {
+  let kind = await detectMediaKind(original);
+  let path = original;
 
-  for (const original of paths) {
-    let kind = await detectMediaKind(original);
-    let path = original;
+  if (kind === "photo") path = await normalizePhoto(original);
+  else if (kind === "video") path = await normalizeVideo(original);
+  else if (kind === "audio" && extname(original).toLowerCase() !== ".mp3") path = await convertAudio(original);
 
-    if (kind === "photo") path = await normalizePhoto(original);
-    else if (kind === "video") path = await normalizeVideo(original);
-    else if (kind === "audio" && extname(original).toLowerCase() !== ".mp3") path = await convertAudio(original);
-
-    let size = await fileSize(path);
-    if (size > env.MAX_UPLOAD_BYTES) {
-      path = kind === "photo"
-        ? await normalizePhoto(path)
-        : kind === "video"
-          ? await normalizeVideo(path)
-          : kind === "audio"
-            ? await convertAudio(path)
-            : path;
-      size = await fileSize(path);
-    }
-
-    if (size > env.MAX_UPLOAD_BYTES) {
-      logger.warn({ path, size }, "Arquivo continuou acima do limite após normalização");
-      continue;
-    }
-
-    const safePath = join(dirname(path), basename(path).replace(/[^a-zA-Z0-9._-]/g, "_"));
-    if (safePath !== path) {
-      try {
-        await rename(path, safePath);
-        path = safePath;
-      } catch {
-        await copyFile(path, safePath);
-        path = safePath;
-      }
-    }
-
-    kind = await detectMediaKind(path);
-    const extension = extname(path).toLowerCase();
-    if (kind === "photo" && extension !== TELEGRAM_PHOTO_EXTENSION) {
-      throw new Error(`Foto não foi normalizada para JPEG: ${basename(path)}`);
-    }
-    if (kind === "video" && extension !== TELEGRAM_VIDEO_EXTENSION) {
-      throw new Error(`Vídeo não foi normalizado para MP4: ${basename(path)}`);
-    }
-
-    output.push({ path, kind, filename: basename(path), size });
-    logger.debug({ path, kind, extension, size }, "Mídia normalizada para o Telegram");
+  let size = await fileSize(path);
+  if (size > env.MAX_UPLOAD_BYTES) {
+    path = kind === "photo"
+      ? await normalizePhoto(path)
+      : kind === "video"
+        ? await normalizeVideo(path)
+        : kind === "audio"
+          ? await convertAudio(path)
+          : path;
+    size = await fileSize(path);
   }
 
-  return output;
+  if (size > env.MAX_UPLOAD_BYTES) {
+    logger.warn({ path, size }, "Arquivo continuou acima do limite após normalização");
+    return undefined;
+  }
+
+  const safePath = join(dirname(path), basename(path).replace(/[^a-zA-Z0-9._-]/g, "_"));
+  if (safePath !== path) {
+    try {
+      await rename(path, safePath);
+      path = safePath;
+    } catch {
+      await copyFile(path, safePath);
+      path = safePath;
+    }
+  }
+
+  kind = await detectMediaKind(path);
+  const extension = extname(path).toLowerCase();
+  if (kind === "photo" && extension !== TELEGRAM_PHOTO_EXTENSION) {
+    throw new Error(`Foto não foi normalizada para JPEG: ${basename(path)}`);
+  }
+  if (kind === "video" && extension !== TELEGRAM_VIDEO_EXTENSION) {
+    throw new Error(`Vídeo não foi normalizado para MP4: ${basename(path)}`);
+  }
+
+  logger.debug({ path, kind, extension, size }, "Mídia normalizada para o Telegram");
+  return { path, kind, filename: basename(path), size };
+}
+
+/**
+ * Ponto único de normalização usado por /dl, /sdl, /ytdl, Shorts e pelo
+ * download automático de todas as plataformas. Mantém a ordem do álbum e
+ * processa no máximo poucas mídias em paralelo para responder rápido sem
+ * saturar CPU/RAM do container.
+ */
+export async function prepareMediaFiles(paths: string[]): Promise<PreparedMediaItem[]> {
+  const queue = new PQueue({ concurrency: Math.min(env.DOWNLOAD_CONCURRENCY, 3) });
+  const prepared = await Promise.all(paths.map((path) => queue.add(() => prepareOneMediaFile(path))));
+  return prepared.filter((item): item is PreparedMediaItem => Boolean(item));
 }

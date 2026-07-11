@@ -68,16 +68,33 @@ describe("Instagram compatível com o fluxo do SmudgeLord", () => {
       ext: "jpg",
     };
     expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/reel/ABC123/")).toBe(true);
-    expect(instagramRemoteItemsFromInfo(info)).toEqual([]);
+    expect(instagramRemoteItemsFromInfo(info, "https://www.instagram.com/reel/ABC123/")).toEqual([]);
   });
 
-  it("não transforma thumbnail de vídeo publicado em /p/ em foto", () => {
+  it("não usa o título herdado Video by para transformar foto de /p/ em vídeo", () => {
     const info = {
       title: "Video by dailyfashion_news",
-      thumbnail: "https://cdn/video-cover.jpg",
+      thumbnail: "https://cdn/photo.jpg",
     };
-    expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/p/ABC123/")).toBe(true);
-    expect(instagramRemoteItemsFromInfo(info)).toEqual([]);
+    expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/p/ABC123/")).toBe(false);
+    expect(instagramRemoteItemsFromInfo(info, "https://www.instagram.com/p/ABC123/")).toEqual([
+      { kind: "photo", url: "https://cdn/photo.jpg", width: undefined, height: undefined },
+    ]);
+  });
+
+  it("mantém carrossel inteiro de fotos mesmo quando o yt-dlp chama cada entrada de Video by", () => {
+    const info = {
+      title: "Post by tbzuyeon",
+      entries: Array.from({ length: 10 }, (_, index) => ({
+        id: `photo-${index + 1}`,
+        title: "Video by tbzuyeon",
+        thumbnails: [{ url: `https://cdn/photo-${index + 1}.jpg`, width: 1080, height: 1350 }],
+      })),
+    };
+    expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/p/DandyoOCIoP/")).toBe(false);
+    const items = instagramRemoteItemsFromInfo(info, "https://www.instagram.com/p/DandyoOCIoP/");
+    expect(items).toHaveLength(10);
+    expect(items.every((item) => item.kind === "photo")).toBe(true);
   });
 
   it("recupera imagens do JSON do yt-dlp mesmo com No video formats found", () => {

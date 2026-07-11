@@ -97,7 +97,6 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     // retornado apenas a thumbnail.
     const instagramExpectsVideo = isInstagramPostUrl(request.url) && (
       isInstagramReelUrl(request.url)
-      || /^(?:video(?:\s+\d+)?|reel)(?:\s+by\b|\s*$|\s+\d+\b)/i.test(metadata.title?.trim() ?? "")
       || Boolean(metadata.duration && metadata.duration > 0)
     );
     if (instagramExpectsVideo && !prepared.some((item) => item.kind === "video")) {

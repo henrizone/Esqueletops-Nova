@@ -4,6 +4,7 @@ import { extname, join } from "node:path";
 import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  canFastRemuxVideo,
   detectMediaKind,
   prepareMediaFiles,
   TELEGRAM_PHOTO_EXTENSION,
@@ -35,6 +36,32 @@ describe("normalização única de mídia", () => {
     const metadata = await sharp(prepared!.path).metadata();
     expect(metadata.width).toBe(123);
     expect(metadata.height).toBe(77);
+  });
+
+
+  it("só usa o caminho rápido quando o MP4 já é seguro para iOS", () => {
+    expect(canFastRemuxVideo({
+      codec_name: "h264",
+      width: 1080,
+      height: 1920,
+      pix_fmt: "yuv420p",
+      sample_aspect_ratio: "1:1",
+    })).toBe(true);
+    expect(canFastRemuxVideo({
+      codec_name: "h264",
+      width: 720,
+      height: 576,
+      pix_fmt: "yuv420p",
+      sample_aspect_ratio: "16:15",
+    })).toBe(false);
+    expect(canFastRemuxVideo({
+      codec_name: "h264",
+      width: 1080,
+      height: 1920,
+      pix_fmt: "yuv420p",
+      sample_aspect_ratio: "1:1",
+      side_data_list: [{ rotation: 90 }],
+    })).toBe(false);
   });
 
   it("classifica GIF como vídeo antes do envio", async () => {

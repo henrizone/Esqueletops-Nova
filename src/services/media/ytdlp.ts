@@ -103,13 +103,15 @@ function directVideoUrl(entry: Info) {
     : undefined;
 }
 
-function titleExpectsVideo(title?: string) {
-  return /^(?:video(?:\s+\d+)?|reel)(?:\s+by\b|\s*$|\s+\d+\b)/i.test(title?.trim() ?? "");
-}
-
+/**
+ * O extrator atual do yt-dlp herda o título `Video by ...` do post para cada
+ * item de um carrossel, inclusive para fotos. Por isso título nunca pode ser
+ * usado para decidir o tipo da mídia. Só sinais estruturais contam.
+ */
 function instagramEntryExpectsVideo(entry: Info, forceVideo = false) {
   return forceVideo
-    || titleExpectsVideo(entry.title)
+    || Boolean(directVideoUrl(entry))
+    || videoFormats(entry).length > 0
     || isVideoExtension(entry.ext ?? entry.video_ext)
     || Boolean(entry.duration && entry.duration > 0);
 }
@@ -119,8 +121,8 @@ function instagramEntryHasVideo(entry: Info) {
 }
 
 export function instagramInfoExpectsVideo(info: Info, sourceUrl?: string) {
-  const forceVideo = Boolean(sourceUrl && isInstagramReelUrl(sourceUrl));
-  return flattenEntries(info).some((entry) => instagramEntryExpectsVideo(entry, forceVideo));
+  if (sourceUrl && isInstagramReelUrl(sourceUrl)) return true;
+  return flattenEntries(info).some((entry) => instagramEntryExpectsVideo(entry));
 }
 
 function videoFormats(entry: Info) {
@@ -149,9 +151,10 @@ function videoFormats(entry: Info) {
  * Recupera fotos e vídeos do JSON do yt-dlp mesmo quando ele informa
  * "No video formats found" para itens de imagem de um carrossel.
  */
-export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
+export function instagramRemoteItemsFromInfo(info: Info, sourceUrl?: string): RemoteMediaItem[] {
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
+  const forceSingleVideo = Boolean(sourceUrl && isInstagramReelUrl(sourceUrl) && !info.entries?.length);
   for (const entry of flattenEntries(info)) {
     const formats = videoFormats(entry);
     const directVideo = directVideoUrl(entry);
@@ -176,9 +179,10 @@ export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
       continue;
     }
 
-    // Um item identificado como vídeo sem URL/formatos contém somente a capa.
-    // Nunca promovemos essa thumbnail a foto da publicação.
-    if (instagramEntryExpectsVideo(entry)) continue;
+    // Em Reel único, uma thumbnail sem MP4 é apenas capa. Em carrosséis /p/,
+    // porém, entradas sem formatos são justamente as fotos reais; o título
+    // `Video by ...` herdado pelo yt-dlp não muda isso.
+    if (instagramEntryExpectsVideo(entry, forceSingleVideo)) continue;
 
     const photo = imageUrl(entry);
     if (photo && !seen.has(photo)) {
@@ -241,14 +245,14 @@ async function probeInstagramRemoteMedia(url: string): Promise<DownloadedMedia> 
   }
 
   const entries = flattenEntries(info);
-  const forceVideo = isInstagramReelUrl(url);
+  const forceSingleVideo = isInstagramReelUrl(url) && !info.entries?.length;
   const missingVideos = entries.filter((entry) =>
-    instagramEntryExpectsVideo(entry, forceVideo) && !instagramEntryHasVideo(entry));
+    instagramEntryExpectsVideo(entry, forceSingleVideo) && !instagramEntryHasVideo(entry));
   if (missingVideos.length) {
     throw new Error(`Instagram identificou ${missingVideos.length} vídeo(s), mas retornou somente thumbnail; capa descartada`);
   }
 
-  const remoteItems = instagramRemoteItemsFromInfo(info);
+  const remoteItems = instagramRemoteItemsFromInfo(info, url);
   if (!remoteItems.length) {
     throw new Error(`yt-dlp retornou ${entries.length} itens, mas nenhuma foto ou vídeo utilizável`);
   }

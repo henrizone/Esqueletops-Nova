@@ -36,8 +36,10 @@ describe("álbuns de mídia", () => {
 });
 
 describe("conversão de vídeo", () => {
-  it("força largura e altura pares para o libx264", () => {
+  it("força dimensões pares e pixels quadrados sem esticar no iOS", () => {
     expect(telegramVideoFilter).toContain("trunc(iw/2)*2");
     expect(telegramVideoFilter).toContain("trunc(ih/2)*2");
+    expect(telegramVideoFilter).toContain("iw*sar");
+    expect(telegramVideoFilter).toContain("setsar=1");
   });
 });
