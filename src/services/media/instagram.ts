@@ -6,10 +6,11 @@ interface InstagramNode {
   __typename?: string;
   id?: string;
   shortcode?: string;
+  dimensions?: { width?: number; height?: number };
   is_video?: boolean;
   video_url?: string;
   display_url?: string;
-  display_resources?: Array<{ src?: string; config_width?: number }>;
+  display_resources?: Array<{ src?: string; config_width?: number; config_height?: number }>;
   owner?: { username?: string };
   coauthor_producers?: Array<{ username?: string }>;
   edge_media_to_caption?: { edges?: Array<{ node?: { text?: string } }> };
@@ -20,7 +21,17 @@ interface InstagramEnvelope {
   shortcode_media?: InstagramNode;
   data?: { xdt_shortcode_media?: InstagramNode };
   xdt_shortcode_media?: InstagramNode;
+  status?: string;
 }
+
+const instagramHeaders: Record<string, string> = {
+  accept: "*/*",
+  "accept-language": "en",
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
 
 export function isInstagramPostUrl(rawUrl: string) {
   try {
@@ -50,6 +61,15 @@ function decodeHtml(value: string) {
     .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)));
 }
 
+function decodeInstagramEscapes(value: string) {
+  return decodeHtml(value)
+    .replace(/\\+u0026/gi, "&")
+    .replace(/\\+u003c/gi, "<")
+    .replace(/\\+u003e/gi, ">")
+    .replace(/\\\//g, "/")
+    .replace(/\\"/g, '"');
+}
+
 function balancedObject(text: string, start: number): string | undefined {
   let depth = 0;
   let inString = false;
@@ -72,12 +92,72 @@ function balancedObject(text: string, start: number): string | undefined {
   return undefined;
 }
 
+function looksLikeMediaNode(value: unknown): value is InstagramNode {
+  if (!value || typeof value !== "object") return false;
+  const node = value as InstagramNode;
+  return Boolean(
+    node.video_url
+    || node.display_url
+    || node.display_resources?.some((item) => item.src)
+    || node.edge_sidecar_to_children?.edges?.length,
+  );
+}
+
+function deepFindMediaNode(value: unknown, depth = 0): InstagramNode | undefined {
+  if (depth > 14 || !value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ["shortcode_media", "xdt_shortcode_media"]) {
+    const candidate = record[key];
+    if (looksLikeMediaNode(candidate)) return candidate;
+  }
+  if (looksLikeMediaNode(value)) return value;
+  for (const child of Object.values(record)) {
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        const found = deepFindMediaNode(item, depth + 1);
+        if (found) return found;
+      }
+    } else {
+      const found = deepFindMediaNode(child, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function parseJsonCandidate(raw: string): InstagramNode | undefined {
+  const variants = [raw, decodeInstagramEscapes(raw)];
+  for (const candidate of variants) {
+    for (const suffix of ["", "}"]) {
+      try {
+        const parsed = JSON.parse(candidate + suffix) as InstagramEnvelope | InstagramNode;
+        const envelope = parsed as InstagramEnvelope;
+        const node = envelope.shortcode_media
+          ?? envelope.data?.xdt_shortcode_media
+          ?? envelope.xdt_shortcode_media
+          ?? deepFindMediaNode(parsed);
+        if (node) return node;
+      } catch {
+        // Tenta a próxima variante.
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Porta o mesmo caminho usado pelo SmudgeLord: primeiro procura o gql_data
+ * serializado no HTML do /embed/captioned e depois tenta os objetos modernos.
+ */
 export function extractInstagramGqlData(html: string): InstagramNode | undefined {
-  const normalized = html
-    .replace(/\\\//g, "/")
-    .replace(/\\"/g, '"')
-    .replace(/\\+u0026/gi, "&")
-    .replace(/\\&/g, "&");
+  // Regex equivalente à usada no SmudgeLord original.
+  const smudgeMatch = html.match(/\\\"gql_data\\\":([\s\S]*)\}\"\}/);
+  if (smudgeMatch?.[1]) {
+    const node = parseJsonCandidate(smudgeMatch[1]);
+    if (node) return node;
+  }
+
+  const normalized = decodeInstagramEscapes(html);
   for (const key of ['"gql_data":', '"shortcode_media":', '"xdt_shortcode_media":']) {
     let cursor = 0;
     while (cursor < normalized.length) {
@@ -88,18 +168,57 @@ export function extractInstagramGqlData(html: string): InstagramNode | undefined
       const raw = balancedObject(normalized, objectStart);
       cursor = objectStart + 1;
       if (!raw) continue;
-      try {
-        const parsed = JSON.parse(raw) as InstagramEnvelope | InstagramNode;
-        if (key === '"shortcode_media":' || key === '"xdt_shortcode_media":') return parsed as InstagramNode;
-        const envelope = parsed as InstagramEnvelope;
-        const node = envelope.shortcode_media ?? envelope.data?.xdt_shortcode_media ?? envelope.xdt_shortcode_media;
+      const node = parseJsonCandidate(raw);
+      if (node) return node;
+    }
+  }
+
+  // O Instagram também coloca o payload em scripts application/json.
+  const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  for (const match of html.matchAll(scriptRegex)) {
+    const script = decodeHtml(match[1] ?? "").trim();
+    if (!script || (!script.includes("shortcode_media") && !script.includes("xdt_shortcode_media") && !script.includes("gql_data"))) continue;
+    const direct = parseJsonCandidate(script);
+    if (direct) return direct;
+    const firstObject = script.indexOf("{");
+    if (firstObject >= 0) {
+      const raw = balancedObject(script, firstObject);
+      if (raw) {
+        const node = parseJsonCandidate(raw);
         if (node) return node;
-      } catch {
-        // Tenta a próxima ocorrência.
       }
     }
   }
+
   return undefined;
+}
+
+/** Fallback de imagem única portado do SmudgeLord. */
+export function extractInstagramSingleImage(html: string): { node: InstagramNode; title?: string } | undefined {
+  const mediaType = html.match(/data-media-type=["']([^"']+)["']/i)?.[1];
+  if (mediaType && !/GraphImage|XDTGraphImage/i.test(mediaType)) return undefined;
+
+  const contentMatch = html.match(/class=["'][^"']*Content[^"']*["'][\s\S]*?<img[^>]+src=["']([^"']+)["']/i)
+    ?? html.match(/class=["']Content[^"']*["'][\s\S]*?src=["']([^"']+)["']/i);
+  const ogImage = metaContent(html, "og:image");
+  const imageUrl = decodeHtml(contentMatch?.[1] ?? ogImage ?? "").replace(/amp;/g, "");
+  if (!imageUrl) return undefined;
+
+  const captionBlock = html.match(/class=["'][^"']*Caption[^"']*["'][\s\S]*?class=["'][^"']*CaptionUsername[^"']*["'][\s\S]*?>([^<]+)<\/a>([\s\S]*?)<div/i);
+  const owner = captionBlock?.[1]?.trim();
+  const caption = captionBlock?.[2]
+    ? decodeHtml(captionBlock[2].replace(/<br\s*\/?\s*>/gi, "\n").replace(/<[^>]*>/g, "")).trim()
+    : undefined;
+
+  return {
+    node: {
+      __typename: "GraphImage",
+      display_url: imageUrl.startsWith("//") ? `https:${imageUrl}` : imageUrl,
+      owner: owner ? { username: owner } : undefined,
+      edge_media_to_caption: caption ? { edges: [{ node: { text: caption } }] } : undefined,
+    },
+    title: metaContent(html, "og:title"),
+  };
 }
 
 function metaContent(html: string, property: string) {
@@ -122,7 +241,7 @@ function bestImage(node: InstagramNode) {
   return resources[0]?.src ?? node.display_url;
 }
 
-function nodeRemoteItems(node: InstagramNode): RemoteMediaItem[] {
+export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[] {
   const children = node.edge_sidecar_to_children?.edges
     ?.map((edge) => edge.node)
     .filter((child): child is InstagramNode => Boolean(child));
@@ -131,10 +250,18 @@ function nodeRemoteItems(node: InstagramNode): RemoteMediaItem[] {
   const seen = new Set<string>();
   for (const child of nodes) {
     const video = Boolean(child.is_video || child.video_url || /Video/i.test(child.__typename ?? ""));
-    const url = (video ? child.video_url : bestImage(child))?.replace(/\\u0026/gi, "&");
+    const url = (video ? child.video_url : bestImage(child))
+      ?.replace(/\\u0026/gi, "&")
+      .replace(/&amp;/gi, "&");
     if (!url || seen.has(url)) continue;
     seen.add(url);
-    items.push({ kind: video ? "video" : "photo", url });
+    items.push({
+      kind: video ? "video" : "photo",
+      url,
+      width: child.dimensions?.width,
+      height: child.dimensions?.height,
+      thumbnailUrl: video ? bestImage(child) : undefined,
+    });
   }
   return items.slice(0, env.MAX_MEDIA_ITEMS);
 }
@@ -157,11 +284,22 @@ async function fetchEmbed(code: string): Promise<{ html: string; node?: Instagra
   const response = await fetch(embedUrl, {
     redirect: "follow",
     signal: AbortSignal.timeout(12_000),
-    headers: { ...browserHeaders, referer: "https://www.instagram.com/" },
+    headers: { ...instagramHeaders, referer: "https://www.instagram.com/" },
   });
   if (!response.ok) throw new Error(`Embed do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
-  return { html, node: extractInstagramGqlData(html) };
+  return { html, node: extractInstagramGqlData(html) ?? extractInstagramSingleImage(html)?.node };
+}
+
+async function fetchPublicPage(code: string): Promise<{ html: string; node?: InstagramNode }> {
+  const response = await fetch(`https://www.instagram.com/p/${code}/`, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(12_000),
+    headers: { ...instagramHeaders, referer: "https://www.instagram.com/" },
+  });
+  if (!response.ok) throw new Error(`Página do Instagram respondeu HTTP ${response.status}`);
+  const html = await response.text();
+  return { html, node: extractInstagramGqlData(html) ?? extractInstagramSingleImage(html)?.node };
 }
 
 async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
@@ -178,9 +316,9 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
     method: "POST",
     signal: AbortSignal.timeout(12_000),
     headers: {
-      ...browserHeaders,
-      accept: "*/*",
+      ...instagramHeaders,
       "content-type": "application/x-www-form-urlencoded",
+      "x-csrftoken": "JKA19cNYckTn_Dr6bcTO5F",
       "x-ig-app-id": "936619743392459",
       "x-fb-lsd": "AVqBX1zadbA",
       "sec-fetch-site": "same-origin",
@@ -191,7 +329,10 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
   });
   if (!response.ok) return undefined;
   const payload = await response.json() as InstagramEnvelope;
-  return payload.data?.xdt_shortcode_media ?? payload.xdt_shortcode_media ?? payload.shortcode_media;
+  return payload.data?.xdt_shortcode_media
+    ?? payload.xdt_shortcode_media
+    ?? payload.shortcode_media
+    ?? deepFindMediaNode(payload);
 }
 
 export async function downloadInstagramMedia(rawUrl: string): Promise<DownloadedMedia> {
@@ -199,17 +340,32 @@ export async function downloadInstagramMedia(rawUrl: string): Promise<Downloaded
   let html = "";
   let node: InstagramNode | undefined;
 
+  // Mesma ordem conceitual do SmudgeLord: embed -> GraphQL. A página pública
+  // entra entre os dois para capturar payloads modernos do Instagram.
   try {
     const embed = await fetchEmbed(code);
     html = embed.html;
     node = embed.node;
   } catch {
-    // O GraphQL abaixo ainda pode funcionar quando o embed é bloqueado.
+    // Continua para os outros caminhos.
+  }
+
+  if (!node) {
+    try {
+      const page = await fetchPublicPage(code);
+      if (!html) html = page.html;
+      node = page.node;
+    } catch {
+      // Continua para GraphQL.
+    }
   }
 
   if (!node) node = await fetchGraphQl(code).catch(() => undefined);
-  const fallback = html ? fallbackFromMeta(html) : { items: [] as RemoteMediaItem[], metadata: {} as MediaMetadata };
-  const remoteItems = node ? nodeRemoteItems(node) : fallback.items;
+
+  const fallback = html
+    ? fallbackFromMeta(html)
+    : { items: [] as RemoteMediaItem[], metadata: {} as MediaMetadata };
+  const remoteItems = node ? instagramNodeRemoteItems(node) : fallback.items;
   if (!remoteItems.length) throw new Error("Instagram não retornou fotos ou vídeos");
 
   const caption = node?.edge_media_to_caption?.edges?.[0]?.node?.text;
@@ -223,7 +379,7 @@ export async function downloadInstagramMedia(rawUrl: string): Promise<Downloaded
       uploader: node?.owner?.username,
       uploaderId: node?.owner?.username,
       webpageUrl: rawUrl,
-      extractor: node ? "instagram-direct" : "instagram-meta",
+      extractor: node ? "instagram-smudge-direct" : "instagram-meta",
     },
   };
 }

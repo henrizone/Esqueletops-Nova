@@ -4,10 +4,29 @@ import { basename, extname, join } from "node:path";
 import { execa } from "execa";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
-import type { DownloadedMedia, DownloadMode, MediaMetadata } from "./types.js";
+import type { DownloadedMedia, DownloadMode, MediaMetadata, RemoteMediaItem } from "./types.js";
 import { downloadWithGalleryDl } from "./gallerydl.js";
 import { downloadInstagramMedia, isInstagramPostUrl } from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
+
+interface FormatInfo {
+  url?: string;
+  ext?: string;
+  protocol?: string;
+  vcodec?: string;
+  acodec?: string;
+  width?: number;
+  height?: number;
+  tbr?: number;
+  filesize?: number;
+  filesize_approx?: number;
+}
+
+interface ThumbnailInfo {
+  url?: string;
+  width?: number;
+  height?: number;
+}
 
 interface Info {
   id?: string;
@@ -22,10 +41,157 @@ interface Info {
   thumbnail?: string;
   extractor_key?: string;
   extractor?: string;
-  entries?: Info[];
+  ext?: string;
+  url?: string;
+  width?: number;
+  height?: number;
+  is_live?: boolean;
+  formats?: FormatInfo[];
+  thumbnails?: ThumbnailInfo[];
+  entries?: Array<Info | null>;
 }
 
 let cookiePromise: Promise<string | undefined> | undefined;
+
+function flattenEntries(info: Info): Info[] {
+  const output: Info[] = [];
+  const visit = (entry: Info | null | undefined) => {
+    if (!entry) return;
+    if (entry.entries?.length) {
+      for (const child of entry.entries) visit(child);
+      return;
+    }
+    output.push(entry);
+  };
+  if (info.entries?.length) {
+    for (const entry of info.entries) visit(entry);
+  } else {
+    output.push(info);
+  }
+  return output;
+}
+
+function bestThumbnail(entry: Info) {
+  const thumbnails = [...(entry.thumbnails ?? [])]
+    .filter((item) => item.url)
+    .sort((a, b) => ((b.width ?? 0) * (b.height ?? 0)) - ((a.width ?? 0) * (a.height ?? 0)));
+  return thumbnails[0]?.url ?? entry.thumbnail;
+}
+
+function imageUrl(entry: Info) {
+  if (entry.url && /^(?:jpe?g|png|webp|gif)$/i.test(entry.ext ?? "")) return entry.url;
+  return bestThumbnail(entry);
+}
+
+function videoFormats(entry: Info) {
+  const maxBytes = env.MAX_UPLOAD_BYTES;
+  return [...(entry.formats ?? [])]
+    .filter((format) => Boolean(format.url) && format.vcodec && format.vcodec !== "none")
+    .filter((format) => !format.height || format.height <= 1080)
+    .filter((format) => {
+      const size = format.filesize ?? format.filesize_approx;
+      return !size || size <= maxBytes;
+    })
+    .sort((a, b) => {
+      const mp4A = a.ext === "mp4" ? 1 : 0;
+      const mp4B = b.ext === "mp4" ? 1 : 0;
+      return mp4B - mp4A
+        || (b.height ?? 0) - (a.height ?? 0)
+        || (b.tbr ?? 0) - (a.tbr ?? 0);
+    });
+}
+
+/**
+ * Recupera fotos e vídeos do JSON do yt-dlp mesmo quando ele informa
+ * "No video formats found" para itens de imagem de um carrossel.
+ */
+export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
+  const items: RemoteMediaItem[] = [];
+  const seen = new Set<string>();
+  for (const entry of flattenEntries(info)) {
+    const formats = videoFormats(entry);
+    if (formats.length) {
+      const urls = formats.map((format) => format.url!).filter((url, index, all) => all.indexOf(url) === index);
+      const url = urls.shift();
+      if (url && !seen.has(url)) {
+        seen.add(url);
+        items.push({
+          kind: "video",
+          url,
+          fallbackUrls: urls,
+          width: formats[0]?.width ?? entry.width,
+          height: formats[0]?.height ?? entry.height,
+          duration: entry.duration,
+          thumbnailUrl: bestThumbnail(entry),
+        });
+      }
+      continue;
+    }
+
+    const photo = imageUrl(entry);
+    if (photo && !seen.has(photo)) {
+      seen.add(photo);
+      items.push({ kind: "photo", url: photo, width: entry.width, height: entry.height });
+    }
+  }
+  return items.slice(0, env.MAX_MEDIA_ITEMS);
+}
+
+async function probeInstagramRemoteMedia(url: string): Promise<DownloadedMedia> {
+  const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-instagram-meta-"));
+  try {
+    const template = join(directory, "%(playlist_index|)s%(id)s-%(title).80B.%(ext)s");
+    let commandError: unknown;
+    try {
+      await execa(env.YTDLP_BINARY, [
+        ...await common(),
+        "--ignore-errors",
+        "--skip-download",
+        "--yes-playlist",
+        "--playlist-end", String(env.MAX_MEDIA_ITEMS),
+        "--restrict-filenames",
+        "--trim-filenames", "120",
+        "--output", template,
+        "--write-info-json",
+        "--write-playlist-metafiles",
+        url,
+      ], {
+        timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 30_000),
+        maxBuffer: 50 * 1024 * 1024,
+      });
+    } catch (error) {
+      // O yt-dlp pode encerrar com código 1 após escrever o JSON da playlist
+      // quando os itens são fotos. O SmudgeLord usa esses URLs diretamente,
+      // então ainda tentamos aproveitar os metadados gerados.
+      commandError = error;
+    }
+
+    const paths = await walk(directory);
+    const jsonPaths = paths.filter((path) => path.endsWith(".info.json"));
+    const parsed: Info[] = [];
+    for (const path of jsonPaths) {
+      try { parsed.push(JSON.parse(await readFile(path, "utf8")) as Info); } catch { /* ignora JSON parcial */ }
+    }
+    const info = parsed.find((item) => item.entries?.length) ?? parsed[0];
+    if (!info) {
+      if (commandError) throw commandError;
+      throw new Error("yt-dlp não gerou metadados do Instagram");
+    }
+
+    const remoteItems = instagramRemoteItemsFromInfo(info);
+    if (!remoteItems.length) throw new Error("yt-dlp não retornou fotos ou vídeos do Instagram");
+    return {
+      files: [],
+      remoteItems,
+      metadata: {
+        ...metadata(info, url),
+        extractor: "instagram-ytdlp-metadata",
+      },
+    };
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
 
 async function cookieFile() {
   const b64 = env.YTDLP_COOKIES_B64;
@@ -155,13 +321,22 @@ export async function downloadMedia(url: string, mode: DownloadMode): Promise<Do
     return downloadTwitterMedia(url);
   }
 
+  const instagram = mode !== "audio" && isInstagramPostUrl(url);
   const extractorErrors: unknown[] = [];
-  if (mode !== "audio" && env.INSTAGRAM_EMBED_ENABLED && isInstagramPostUrl(url)) {
+  if (instagram) {
+    if (env.INSTAGRAM_EMBED_ENABLED) {
+      try {
+        return await downloadInstagramMedia(url);
+      } catch (error) {
+        extractorErrors.push(error);
+        logger.info({ url, error }, "Extração direta do Instagram indisponível; tentando metadados do yt-dlp");
+      }
+    }
     try {
-      return await downloadInstagramMedia(url);
+      return await probeInstagramRemoteMedia(url);
     } catch (error) {
       extractorErrors.push(error);
-      logger.info({ url, error }, "Embed do Instagram indisponível; tentando yt-dlp");
+      logger.info({ url, error }, "Metadados do Instagram indisponíveis; tentando download convencional");
     }
   }
 
@@ -169,7 +344,7 @@ export async function downloadMedia(url: string, mode: DownloadMode): Promise<Do
     return await downloadWithYtDlp(url, mode);
   } catch (ytDlpError) {
     extractorErrors.push(ytDlpError);
-    if (mode === "audio" || !env.GALLERYDL_ENABLED) {
+    if (mode === "audio" || instagram || !env.GALLERYDL_ENABLED) {
       if (extractorErrors.length === 1) throw ytDlpError;
       throw new AggregateError(extractorErrors, "Nenhum extrator conseguiu baixar a publicação");
     }
