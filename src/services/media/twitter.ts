@@ -98,11 +98,20 @@ function displayAuthor(author?: FxAuthor) {
   };
 }
 
+function twitterProfileUrl(username: string) {
+  return `https://x.com/${encodeURIComponent(username)}`;
+}
+
+function linkedTwitterAuthor(author: ReturnType<typeof displayAuthor>) {
+  const label = `${author.name} (@${author.username})`;
+  return `<a href="${escapeHtml(twitterProfileUrl(author.username))}">${escapeHtml(label)}</a>`;
+}
+
 export function buildTwitterCaption(tweet: FxTweet): string {
   const author = displayAuthor(tweet.author);
   const rootText = trimTrailingTrackingUrl(tweet.text ?? "");
   const lines = [
-    `<b>${escapeHtml(author.name)} (<code>${escapeHtml(author.username)}</code>):</b>`,
+    `${linkedTwitterAuthor(author)}:`,
     escapeHtml(truncate(rootText, 520)),
   ];
 
@@ -111,7 +120,7 @@ export function buildTwitterCaption(tweet: FxTweet): string {
     const quoteText = truncate(trimTrailingTrackingUrl(tweet.quote.text ?? ""), 248);
     if (quoteText || tweet.quote.author) {
       lines.push(
-        `<blockquote><i>Quoting</i> <b>${escapeHtml(quoteAuthor.name)} (<code>${escapeHtml(quoteAuthor.username)}</code>):</b>\n${escapeHtml(quoteText)}</blockquote>`,
+        `<blockquote><i>Quoting</i> ${linkedTwitterAuthor(quoteAuthor)}:\n${escapeHtml(quoteText)}</blockquote>`,
       );
     }
   }
@@ -322,6 +331,7 @@ export async function downloadTwitterMedia(rawUrl: string): Promise<DownloadedMe
       id,
       uploader: author.name,
       uploaderId: author.username,
+      profileUrl: twitterProfileUrl(author.username),
       description: tweet?.text,
       webpageUrl: tweet?.url ?? rawUrl,
       extractor: graphItems.length ? "twitter-direct" : "fxtwitter",

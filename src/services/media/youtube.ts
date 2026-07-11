@@ -11,6 +11,7 @@ import { logger } from "../../config/logger.js";
 import type { BotContext } from "../../types/context.js";
 import { escapeHtml } from "../../utils/html.js";
 import { sourceKeyboard } from "./source-button.js";
+import { linkedAuthorHtml, resolveMediaAuthor } from "./profile.js";
 import { prepareMediaFiles } from "./convert.js";
 import { cookieFileForUrl } from "./cookies.js";
 import { canonicalYouTubeUrl } from "./urls.js";
@@ -35,7 +36,11 @@ export interface YouTubeInfo {
   id: string;
   title: string;
   uploader?: string;
+  uploader_id?: string;
+  uploader_url?: string;
   channel?: string;
+  channel_id?: string;
+  channel_url?: string;
   duration?: number;
   webpage_url?: string;
   thumbnail?: string;
@@ -182,12 +187,19 @@ async function makeThumbnailFromUrl(url?: string) {
 }
 
 function cacheKey(id: string, mode: YouTubeDownloadMode) {
-  return `youtube:v5:${id}:${mode}`;
+  return `youtube:v6:${id}:${mode}`;
 }
 
 function captionFor(info: YouTubeInfo) {
   const uploader = info.uploader ?? info.channel ?? "YouTube";
-  return `<b>${escapeHtml(uploader)}:</b> ${escapeHtml(info.title)}`;
+  const author = resolveMediaAuthor({
+    uploader,
+    uploaderId: info.uploader_id ?? info.channel_id,
+    profileUrl: info.uploader_url ?? info.channel_url,
+    webpageUrl: info.webpage_url,
+  }, info.webpage_url ?? "https://www.youtube.com/");
+  const authorHtml = author ? linkedAuthorHtml(author) : `<b>${escapeHtml(uploader)}</b>`;
+  return `${authorHtml}: ${escapeHtml(info.title)}`;
 }
 
 function replyParams(messageId?: number) {

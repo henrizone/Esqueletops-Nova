@@ -455,8 +455,11 @@ export async function downloadInstagramMedia(rawUrl: string): Promise<Downloaded
       id: selectedNode?.id ?? code,
       title: fallback.metadata.title ?? singleImage?.title,
       description: caption ?? fallback.metadata.description,
-      uploader: selectedNode?.owner?.username,
-      uploaderId: selectedNode?.owner?.username,
+      uploader: selectedNode?.owner?.username ?? fallback.metadata.uploader,
+      uploaderId: selectedNode?.owner?.username ?? fallback.metadata.uploaderId,
+      profileUrl: selectedNode?.owner?.username
+        ? `https://www.instagram.com/${encodeURIComponent(selectedNode.owner.username)}/`
+        : fallback.metadata.profileUrl,
       webpageUrl: rawUrl,
       extractor,
     },

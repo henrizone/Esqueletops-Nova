@@ -39,6 +39,12 @@ interface Info {
   uploader?: string;
   channel?: string;
   uploader_id?: string;
+  uploader_url?: string;
+  channel_id?: string;
+  channel_url?: string;
+  creator?: string;
+  creator_id?: string;
+  creator_url?: string;
   duration?: number;
   webpage_url?: string;
   original_url?: string;
@@ -298,8 +304,10 @@ function metadata(info: Info, url: string): MediaMetadata {
     id: info.id ?? source.id,
     title: info.title ?? source.title,
     description: info.description ?? source.description,
-    uploader: info.uploader ?? info.channel ?? source.uploader ?? source.channel,
-    uploaderId: info.uploader_id ?? source.uploader_id,
+    uploader: info.uploader ?? info.channel ?? info.creator ?? source.uploader ?? source.channel ?? source.creator,
+    uploaderId: info.uploader_id ?? info.channel_id ?? info.creator_id ?? source.uploader_id ?? source.channel_id ?? source.creator_id,
+    profileUrl: info.uploader_url ?? info.channel_url ?? info.creator_url
+      ?? source.uploader_url ?? source.channel_url ?? source.creator_url,
     duration: info.duration ?? source.duration,
     webpageUrl: info.webpage_url ?? source.webpage_url ?? info.original_url ?? url,
     thumbnail: info.thumbnail ?? source.thumbnail,

@@ -45,7 +45,9 @@ async function metadataFromFiles(paths: string[], url: string): Promise<MediaMet
         id: firstString(parsed, ["post_id", "shortcode", "tweet_id", "id"]),
         title: firstString(parsed, ["title", "headline"]),
         description: firstString(parsed, ["description", "caption", "content", "text"]),
-        uploader: firstString(parsed, ["username", "uploader", "author", "user", "owner"]),
+        uploader: firstString(parsed, ["display_name", "nickname", "username", "uploader", "author", "user", "owner"]),
+        uploaderId: firstString(parsed, ["username", "screen_name", "user_name", "uploader_id", "author_id"]),
+        profileUrl: firstString(parsed, ["profile_url", "user_url", "author_url", "uploader_url", "channel_url"]),
         webpageUrl: firstString(parsed, ["post_url", "webpage_url", "permalink"]) ?? url,
         extractor: "gallery-dl",
       };

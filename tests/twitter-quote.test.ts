@@ -21,11 +21,11 @@ describe("Twitter/X quote handling", () => {
 
   it("formata o quote como texto e remove o t.co final", () => {
     const caption = buildTwitterCaption(tweet);
-    expect(caption).toContain("<b>xeessa (<code>bilyeoongoyangi</code>):</b>");
+    expect(caption).toContain('<a href="https://x.com/bilyeoongoyangi">xeessa (@bilyeoongoyangi)</a>:');
     expect(caption).toContain("Kkkkkkkkkkk");
     expect(caption).not.toContain("t.co/abc123");
     expect(caption).toContain("<blockquote><i>Quoting</i>");
-    expect(caption).toContain("sarah 🍒");
+    expect(caption).toContain('<a href="https://x.com/cortisnoonyy">sarah 🍒 (@cortisnoonyy)</a>');
     expect(caption).not.toContain("quoted.jpg");
   });
 

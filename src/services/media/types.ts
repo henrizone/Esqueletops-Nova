@@ -7,6 +7,8 @@ export interface MediaMetadata {
   description?: string;
   uploader?: string;
   uploaderId?: string;
+  /** URL pública do perfil/canal do autor quando disponível. */
+  profileUrl?: string;
   duration?: number;
   webpageUrl?: string;
   thumbnail?: string;
