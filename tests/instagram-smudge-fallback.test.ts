@@ -4,7 +4,7 @@ import {
   instagramNodeRemoteItems,
   instagramPageExpectsVideo,
 } from "../src/services/media/instagram.js";
-import { instagramRemoteItemsFromInfo } from "../src/services/media/ytdlp.js";
+import { instagramInfoExpectsVideo, instagramRemoteItemsFromInfo } from "../src/services/media/ytdlp.js";
 
 describe("Instagram compatível com o fluxo do SmudgeLord", () => {
   it("extrai imagem única do HTML do embed quando não há gql_data", () => {
@@ -58,6 +58,26 @@ describe("Instagram compatível com o fluxo do SmudgeLord", () => {
     });
     expect(items.map((item) => item.kind)).toEqual(["photo", "video"]);
     expect(items[1]?.thumbnailUrl).toBe("https://cdn/thumb.jpg");
+  });
+
+
+  it("não transforma thumbnail do fallback yt-dlp em foto de Reel", () => {
+    const info = {
+      title: "Video by artista",
+      thumbnail: "https://cdn/reel-cover.jpg",
+      ext: "jpg",
+    };
+    expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/reel/ABC123/")).toBe(true);
+    expect(instagramRemoteItemsFromInfo(info)).toEqual([]);
+  });
+
+  it("não transforma thumbnail de vídeo publicado em /p/ em foto", () => {
+    const info = {
+      title: "Video by dailyfashion_news",
+      thumbnail: "https://cdn/video-cover.jpg",
+    };
+    expect(instagramInfoExpectsVideo(info, "https://www.instagram.com/p/ABC123/")).toBe(true);
+    expect(instagramRemoteItemsFromInfo(info)).toEqual([]);
   });
 
   it("recupera imagens do JSON do yt-dlp mesmo com No video formats found", () => {

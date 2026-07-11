@@ -6,7 +6,7 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { DownloadedMedia, DownloadMode, MediaMetadata, RemoteMediaItem } from "./types.js";
 import { downloadWithGalleryDl } from "./gallerydl.js";
-import { downloadInstagramMedia, isInstagramPostUrl } from "./instagram.js";
+import { downloadInstagramMedia, isInstagramPostUrl, isInstagramReelUrl } from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
 import { cookieFileForUrl } from "./cookies.js";
 
@@ -95,6 +95,34 @@ function isVideoExtension(value?: string) {
   return /^(?:mp4|m4v|mov|webm|mkv)$/i.test(value ?? "");
 }
 
+function directVideoUrl(entry: Info) {
+  return entry.url
+    && entry._type !== "url"
+    && (isVideoExtension(entry.ext ?? entry.video_ext) || /\.(?:mp4|m4v|mov|webm)(?:$|[?#])/i.test(entry.url))
+    ? entry.url
+    : undefined;
+}
+
+function titleExpectsVideo(title?: string) {
+  return /^(?:video(?:\s+\d+)?|reel)(?:\s+by\b|\s*$|\s+\d+\b)/i.test(title?.trim() ?? "");
+}
+
+function instagramEntryExpectsVideo(entry: Info, forceVideo = false) {
+  return forceVideo
+    || titleExpectsVideo(entry.title)
+    || isVideoExtension(entry.ext ?? entry.video_ext)
+    || Boolean(entry.duration && entry.duration > 0);
+}
+
+function instagramEntryHasVideo(entry: Info) {
+  return Boolean(directVideoUrl(entry) || videoFormats(entry).length);
+}
+
+export function instagramInfoExpectsVideo(info: Info, sourceUrl?: string) {
+  const forceVideo = Boolean(sourceUrl && isInstagramReelUrl(sourceUrl));
+  return flattenEntries(info).some((entry) => instagramEntryExpectsVideo(entry, forceVideo));
+}
+
 function videoFormats(entry: Info) {
   const maxBytes = env.MAX_UPLOAD_BYTES;
   return [...(entry.formats ?? [])]
@@ -126,11 +154,7 @@ export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
   const seen = new Set<string>();
   for (const entry of flattenEntries(info)) {
     const formats = videoFormats(entry);
-    const directVideo = entry.url
-      && entry._type !== "url"
-      && (isVideoExtension(entry.ext ?? entry.video_ext) || /\.(?:mp4|m4v|mov|webm)(?:$|[?#])/i.test(entry.url))
-      ? entry.url
-      : undefined;
+    const directVideo = directVideoUrl(entry);
 
     if (formats.length || directVideo) {
       const urls = [directVideo, ...formats.map((format) => format.url)]
@@ -151,6 +175,10 @@ export function instagramRemoteItemsFromInfo(info: Info): RemoteMediaItem[] {
       }
       continue;
     }
+
+    // Um item identificado como vídeo sem URL/formatos contém somente a capa.
+    // Nunca promovemos essa thumbnail a foto da publicação.
+    if (instagramEntryExpectsVideo(entry)) continue;
 
     const photo = imageUrl(entry);
     if (photo && !seen.has(photo)) {
@@ -212,9 +240,17 @@ async function probeInstagramRemoteMedia(url: string): Promise<DownloadedMedia> 
     throw new Error("yt-dlp não gerou JSON do Instagram");
   }
 
+  const entries = flattenEntries(info);
+  const forceVideo = isInstagramReelUrl(url);
+  const missingVideos = entries.filter((entry) =>
+    instagramEntryExpectsVideo(entry, forceVideo) && !instagramEntryHasVideo(entry));
+  if (missingVideos.length) {
+    throw new Error(`Instagram identificou ${missingVideos.length} vídeo(s), mas retornou somente thumbnail; capa descartada`);
+  }
+
   const remoteItems = instagramRemoteItemsFromInfo(info);
   if (!remoteItems.length) {
-    throw new Error(`yt-dlp retornou ${flattenEntries(info).length} itens, mas nenhuma foto ou vídeo utilizável`);
+    throw new Error(`yt-dlp retornou ${entries.length} itens, mas nenhuma foto ou vídeo utilizável`);
   }
 
   logger.info({
@@ -356,10 +392,16 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<Downl
     const all = await walk(directory);
     let mediaMetadata: MediaMetadata = { webpageUrl: url };
     const jsonFiles = all.filter((path) => path.endsWith(".info.json"));
+    const expectedVideoBases = new Set<string>();
+    let expectsAnyVideo = isInstagramReelUrl(url);
     for (const infoPath of jsonFiles) {
       try {
         const parsed = JSON.parse(await readFile(infoPath, "utf8")) as Info;
         mediaMetadata = metadata(parsed, url);
+        if (instagramInfoExpectsVideo(parsed, url)) expectsAnyVideo = true;
+        if (!parsed.entries?.length && instagramEntryExpectsVideo(parsed, isInstagramReelUrl(url))) {
+          expectedVideoBases.add(infoPath.slice(0, -".info.json".length));
+        }
         if (parsed.entries?.length) break;
       } catch {
         // ignora JSON parcial
@@ -382,16 +424,23 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<Downl
     // é apenas capa e não deve virar uma foto extra no álbum.
     const videoExtensions = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv"]);
     const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif"]);
+    const videoFiles = files.filter((path) => videoExtensions.has(extname(path).toLowerCase()));
     const stemsWithVideo = new Set(
-      files
-        .filter((path) => videoExtensions.has(extname(path).toLowerCase()))
-        .map((path) => path.slice(0, -extname(path).length).replace(/\.(?:webp|jpg|jpeg|png)$/i, "")),
+      videoFiles.map((path) => path.slice(0, -extname(path).length).replace(/\.(?:webp|jpg|jpeg|png)$/i, "")),
     );
+    const missingExpectedVideos = [...expectedVideoBases].filter((base) => !stemsWithVideo.has(base));
+    if (instagram && expectsAnyVideo && !videoFiles.length) {
+      throw new Error("Instagram identificou publicação em vídeo, mas o yt-dlp baixou somente a thumbnail; capa descartada");
+    }
+    if (instagram && missingExpectedVideos.length) {
+      throw new Error(`Instagram não baixou ${missingExpectedVideos.length} vídeo(s) do carrossel; thumbnails descartadas`);
+    }
+
     const usableFiles = files.filter((path) => {
       const extension = extname(path).toLowerCase();
       if (!imageExtensions.has(extension)) return true;
       const stem = path.slice(0, -extension.length).replace(/\.(?:webp|jpg|jpeg|png)$/i, "");
-      return !stemsWithVideo.has(stem);
+      return !stemsWithVideo.has(stem) && !expectedVideoBases.has(stem);
     });
 
     if (!usableFiles.length) {

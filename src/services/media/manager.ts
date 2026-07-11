@@ -12,6 +12,7 @@ import { sendCachedMedia, sendPreparedMedia, sendTextPost } from "./sender.js";
 import type { CachedMediaPayload, DownloadRequest, PreparedMediaItem } from "./types.js";
 import { mediaCacheKey } from "./urls.js";
 import { downloadMedia } from "./ytdlp.js";
+import { isInstagramPostUrl, isInstagramReelUrl } from "./instagram.js";
 
 async function logFailure(ctx: BotContext, code: string, request: DownloadRequest, error: unknown) {
   logger.error({ code, error, request }, "Falha no download");
@@ -89,6 +90,18 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
       prepared = await prepareMediaFiles(local.files);
     } else if (downloaded.files.length) {
       prepared = await prepareMediaFiles(downloaded.files);
+    }
+
+    // Última barreira antes do Telegram: Reel ou post identificado como vídeo
+    // jamais pode ser enviado como foto, mesmo que algum fallback tenha
+    // retornado apenas a thumbnail.
+    const instagramExpectsVideo = isInstagramPostUrl(request.url) && (
+      isInstagramReelUrl(request.url)
+      || /^(?:video(?:\s+\d+)?|reel)(?:\s+by\b|\s*$|\s+\d+\b)/i.test(metadata.title?.trim() ?? "")
+      || Boolean(metadata.duration && metadata.duration > 0)
+    );
+    if (instagramExpectsVideo && !prepared.some((item) => item.kind === "video")) {
+      throw new Error("Instagram identificou publicação em vídeo, mas nenhum MP4 foi obtido; thumbnail não será enviada como foto");
     }
 
     let items: CachedMediaPayload["items"] = [];
