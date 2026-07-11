@@ -28,6 +28,7 @@ const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("production"),
   TZ: z.string().default("America/Sao_Paulo"),
   YTDLP_BINARY: z.string().default("yt-dlp"),
+  YOUTUBE_HELPER_BINARY: z.string().default("/usr/local/bin/esqueletops-youtube"),
   GALLERYDL_BINARY: z.string().default("gallery-dl"),
   GALLERYDL_ENABLED: bool.default(true),
   INSTAGRAM_EMBED_ENABLED: bool.default(true),

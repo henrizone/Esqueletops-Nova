@@ -1,6 +1,6 @@
 import { InputFile } from "grammy";
 import type { Message } from "grammy/types";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { execa } from "execa";
@@ -41,6 +41,24 @@ export interface YouTubeInfo {
   formats?: YouTubeFormat[];
 }
 
+interface HelperFormat {
+  itag: number;
+  size: number;
+  width?: number;
+  height?: number;
+  quality_label?: string;
+}
+
+interface HelperInfo {
+  id: string;
+  title: string;
+  author: string;
+  duration_seconds: number;
+  thumbnail?: string;
+  video?: HelperFormat;
+  audio?: HelperFormat;
+}
+
 interface YouTubeCache {
   fileId: string;
   mode: YouTubeDownloadMode;
@@ -67,7 +85,58 @@ async function commonArgs(url: string) {
   return args;
 }
 
-export async function probeYouTube(url: string): Promise<YouTubeInfo> {
+async function helperArgs(url: string) {
+  const args = ["--url", url, "--max-bytes", String(env.MAX_UPLOAD_BYTES)];
+  const cookies = await cookieFileForUrl(url);
+  if (cookies) args.push("--cookies", cookies);
+  return args;
+}
+
+function helperToInfo(info: HelperInfo): YouTubeInfo {
+  const formats: YouTubeFormat[] = [];
+  if (info.video) {
+    formats.push({
+      format_id: String(info.video.itag),
+      ext: "mp4",
+      vcodec: "h264",
+      acodec: "none",
+      width: info.video.width,
+      height: info.video.height,
+      filesize: info.video.size,
+    });
+  }
+  if (info.audio) {
+    formats.push({
+      format_id: String(info.audio.itag),
+      ext: "m4a",
+      vcodec: "none",
+      acodec: "aac",
+      filesize: info.audio.size,
+    });
+  }
+  return {
+    id: info.id,
+    title: info.title,
+    uploader: info.author,
+    channel: info.author,
+    duration: info.duration_seconds,
+    webpage_url: `https://www.youtube.com/watch?v=${info.id}`,
+    thumbnail: info.thumbnail,
+    formats,
+  };
+}
+
+async function probeWithHelper(url: string): Promise<YouTubeInfo> {
+  const result = await execa(env.YOUTUBE_HELPER_BINARY, ["info", ...await helperArgs(url)], {
+    timeout: Math.min(env.DOWNLOAD_TIMEOUT_SECONDS * 1000, 60_000),
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  const info = helperToInfo(JSON.parse(result.stdout) as HelperInfo);
+  if (!info.id || !info.title) throw new Error("O YouTube não retornou os dados do vídeo");
+  return info;
+}
+
+async function probeWithYtDlp(url: string): Promise<YouTubeInfo> {
   const result = await execa(env.YTDLP_BINARY, [
     ...await commonArgs(url),
     "--dump-single-json",
@@ -80,6 +149,15 @@ export async function probeYouTube(url: string): Promise<YouTubeInfo> {
   const info = JSON.parse(result.stdout) as YouTubeInfo;
   if (!info.id || !info.title) throw new Error("O YouTube não retornou os dados do vídeo");
   return info;
+}
+
+export async function probeYouTube(url: string): Promise<YouTubeInfo> {
+  try {
+    return await probeWithHelper(url);
+  } catch (helperError) {
+    logger.warn({ error: helperError, url }, "Cliente direto do YouTube indisponível; tentando yt-dlp");
+    return probeWithYtDlp(url);
+  }
 }
 
 function estimatedBytes(info: YouTubeInfo, mode: YouTubeDownloadMode) {
@@ -149,8 +227,23 @@ async function makeThumbnail(input?: string) {
   }
 }
 
+async function makeThumbnailFromUrl(url?: string) {
+  if (!url) return undefined;
+  const source = join(tmpdir(), `esqueletops-youtube-thumb-source-${crypto.randomUUID()}`);
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) return undefined;
+    await writeFile(source, Buffer.from(await response.arrayBuffer()));
+    return await makeThumbnail(source);
+  } catch {
+    return undefined;
+  } finally {
+    await rm(source, { force: true }).catch(() => undefined);
+  }
+}
+
 function cacheKey(id: string, mode: YouTubeDownloadMode) {
-  return `youtube:v2:${id}:${mode}`;
+  return `youtube:v3:${id}:${mode}`;
 }
 
 function captionFor(info: YouTubeInfo) {
@@ -184,7 +277,29 @@ async function sendCached(
   return ctx.replyWithVideo(cached.fileId, { ...common, supports_streaming: true });
 }
 
-async function downloadFile(url: string, mode: YouTubeDownloadMode) {
+async function downloadWithHelper(url: string, mode: YouTubeDownloadMode, info: YouTubeInfo) {
+  const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-youtube-direct-"));
+  const mediaPath = join(directory, mode === "audio" ? `${info.id}.m4a` : `${info.id}.mp4`);
+  try {
+    const result = await execa(env.YOUTUBE_HELPER_BINARY, [
+      "download",
+      ...await helperArgs(url),
+      "--mode", mode,
+      "--output", mediaPath,
+    ], {
+      timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    const downloadedInfo = helperToInfo(JSON.parse(result.stdout) as HelperInfo);
+    const thumbnailPath = await makeThumbnailFromUrl(downloadedInfo.thumbnail ?? info.thumbnail);
+    return { directory, mediaPath, thumbnailPath, info: downloadedInfo };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function downloadWithYtDlp(url: string, mode: YouTubeDownloadMode) {
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-youtube-"));
   const outputTemplate = join(directory, "%(id)s-%(title).80B.%(ext)s");
   const args = [
@@ -221,7 +336,7 @@ async function downloadFile(url: string, mode: YouTubeDownloadMode) {
     const infoPath = files.find((path) => path.endsWith(".info.json"));
     const info = infoPath
       ? JSON.parse(await readFile(infoPath, "utf8")) as YouTubeInfo
-      : await probeYouTube(url);
+      : await probeWithYtDlp(url);
     const mediaExtensions = mode === "audio"
       ? new Set([".mp3", ".m4a", ".aac", ".ogg", ".opus"])
       : new Set([".mp4", ".mkv", ".webm", ".mov", ".m4v"]);
@@ -233,6 +348,15 @@ async function downloadFile(url: string, mode: YouTubeDownloadMode) {
   } catch (error) {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
+  }
+}
+
+async function downloadFile(url: string, mode: YouTubeDownloadMode, info: YouTubeInfo) {
+  try {
+    return await downloadWithHelper(url, mode, info);
+  } catch (helperError) {
+    logger.warn({ error: helperError, url, mode }, "Download direto do YouTube falhou; tentando yt-dlp");
+    return downloadWithYtDlp(url, mode);
   }
 }
 
@@ -254,7 +378,7 @@ export async function sendYouTubeDownload(input: {
   }
 
   await ctx.api.sendChatAction(ctx.chat!.id, mode === "audio" ? "upload_voice" : "upload_video").catch(() => undefined);
-  const downloaded = await downloadFile(url, mode);
+  const downloaded = await downloadFile(url, mode, info);
   try {
     const prepared = await prepareMediaFiles([downloaded.mediaPath]);
     const item = prepared[0];

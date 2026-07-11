@@ -11,6 +11,13 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
+FROM golang:1.25-bookworm AS youtube-builder
+WORKDIR /src
+COPY youtube-helper/go.mod ./
+RUN go mod download
+COPY youtube-helper/main.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/esqueletops-youtube ./main.go
+
 FROM node:24-bookworm-slim AS runtime
 ARG YTDLP_VERSION=2026.7.4
 ARG GALLERYDL_VERSION=1.32.5
@@ -19,6 +26,7 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
     YTDLP_BINARY=/opt/yt-dlp/bin/yt-dlp \
+    YOUTUBE_HELPER_BINARY=/usr/local/bin/esqueletops-youtube \
     GALLERYDL_BINARY=/opt/yt-dlp/bin/gallery-dl \
     FFMPEG_BINARY=ffmpeg \
     FFPROBE_BINARY=ffprobe
@@ -29,10 +37,12 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY --from=youtube-builder /out/esqueletops-youtube /usr/local/bin/esqueletops-youtube
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
-RUN chown -R node:node /app
+RUN chown -R node:node /app \
+    && chmod 755 /usr/local/bin/esqueletops-youtube
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 CMD ["node", "-e", "const port=process.env.PORT||'3000';fetch('http://127.0.0.1:'+port+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
