@@ -41,9 +41,18 @@ function remoteItemsAreTelegramReady(items: RemoteMediaItem[]): boolean {
   if (!items.length) return false;
   return items.every((item) => {
     if (item.kind === "photo") return true;
-    // Vídeo: precisa ser MP4 na URL (Twitter, a maioria dos CDNs) para pular o ffmpeg.
+    // Vídeo: aceitamos se a URL for MP4 explícito (Twitter, maioria dos CDNs) OU
+    // se vier de um CDN de vídeo confiável que serve MP4 sem a extensão no
+    // caminho (ex.: proxy do TikTok/tikwm). Assim o TikTok também pula o ffmpeg.
     const url = (item.url ?? "").toLowerCase();
-    return /\.mp4(?:$|[?#])/.test(url);
+    if (/\.mp4(?:$|[?#])/.test(url)) return true;
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      const trustedVideoHosts = ["tikwm.com", "tiktokcdn", "muscdn.com", "byteoversea.com"];
+      return trustedVideoHosts.some((h) => host === h || host.endsWith(`.${h}`) || host.includes(h));
+    } catch {
+      return false;
+    }
   });
 }
 

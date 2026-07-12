@@ -75,15 +75,61 @@ function remoteUrls(item: RemoteMediaItem) {
  * Alguns CDNs são públicos e o próprio Telegram consegue baixar a mídia a
  * partir da URL, sem precisar que o bot faça streaming pelo Node. Isso torna o
  * envio praticamente instantâneo (o arquivo nunca passa pela nossa máquina).
- * Só habilitamos para hosts que sabidamente não exigem cabeçalho referer,
- * como o CDN de vídeo do Twitter/X.
+ *
+ * Habilitamos para hosts que NÃO exigem cabeçalho referer nem cookies: os CDNs
+ * de vídeo/foto do Twitter/X, Instagram (Facebook CDN), TikTok (ByteDance) e
+ * Reddit. Se um link específico falhar (expirou, exige referer, etc.), o chamador
+ * já cai automaticamente no streaming pelo bot (`remoteInput`), então o pior caso
+ * é voltar ao comportamento antigo — nunca uma falha para o usuário.
+ *
+ * A lista pode ser estendida/reduzida via env `TELEGRAM_DIRECT_CDN_HOSTS`
+ * (separada por vírgulas) sem recompilar.
  */
+const DEFAULT_DIRECT_CDN_HOSTS = [
+  // Twitter / X
+  "twimg.com",
+  "twitter.com",
+  // Instagram / Facebook CDN
+  "cdninstagram.com",
+  "fbcdn.net",
+  // TikTok / ByteDance CDNs
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "tiktokcdn-eu.com",
+  "muscdn.com",
+  "byteoversea.com",
+  "ibytedtos.com",
+  "ipstatp.com",
+  // Reddit
+  "redd.it",
+  "redditmedia.com",
+  // Proxy do extrator de TikTok (tikwm) -- URLs públicas, sem referer.
+  "tikwm.com",
+];
+
+function directCdnHosts(): string[] {
+  const extra = (env.TELEGRAM_DIRECT_CDN_HOSTS ?? "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  return [...DEFAULT_DIRECT_CDN_HOSTS, ...extra];
+}
+
+function hostMatchesDirectCdn(host: string): boolean {
+  for (const cdn of directCdnHosts()) {
+    // Casa o host exato ou qualquer subdomínio: "cdninstagram.com" cobre
+    // "scontent-xyz.cdninstagram.com". `includes` cobre variações como
+    // "v16-webapp.tiktokcdn-us.com".
+    if (host === cdn || host.endsWith(`.${cdn}`) || host.includes(cdn)) return true;
+  }
+  return false;
+}
+
 function telegramCanFetchDirectly(url: string): boolean {
   if (!env.REMOTE_FAST_PATH) return false;
   try {
     const host = new URL(url).hostname.toLowerCase();
-    // CDNs públicos que não exigem referer: o Telegram baixa direto.
-    return host.endsWith("twimg.com") || host.endsWith("twitter.com");
+    return hostMatchesDirectCdn(host);
   } catch {
     return false;
   }

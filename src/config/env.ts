@@ -66,6 +66,17 @@ const schema = z.object({
   // dos CDNs) direto ao Telegram, sem baixar em disco nem passar pelo FFmpeg.
   // É o que torna o envio quase instantâneo, como no SmudgeLord.
   REMOTE_FAST_PATH: bool.default(true),
+  // Hosts de CDN extras (separados por vírgula) que o Telegram pode baixar
+  // direto, além dos padrões (Twitter/Instagram/TikTok/Reddit). Ex:
+  // "meucdn.com,outrocdn.net". Deixe vazio para usar só os padrões.
+  TELEGRAM_DIRECT_CDN_HOSTS: z.string().default(""),
+  // Extrator dedicado de TikTok (via API tikwm) em vez do yt-dlp. Muito mais
+  // rápido: devolve a URL direta do MP4 sem marca d'água, igual ao Twitter.
+  TIKTOK_DIRECT_ENABLED: bool.default(true),
+  TIKTOK_API_URL: z.string().default("https://www.tikwm.com/api/"),
+  // Timeout curto por tentativa nos fallbacks do Instagram, para falhar rápido
+  // e ir para a próxima estratégia em vez de travar.
+  INSTAGRAM_ATTEMPT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(4000),
   MEDIA_CACHE_TTL_SECONDS: z.coerce.number().int().min(60).default(604800),
   MEDIA_PROGRESS_MESSAGES: bool.default(false),
   MEDIA_INCLUDE_SOURCE_LINK: bool.default(true),

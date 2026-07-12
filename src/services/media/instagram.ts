@@ -321,7 +321,7 @@ async function fetchEmbed(code: string): Promise<{ html: string; node?: Instagra
   const embedUrl = `https://www.instagram.com/p/${code}/embed/captioned/`;
   const response = await fetch(embedUrl, {
     redirect: "follow",
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS),
     headers: requestHeaders({ referer: "https://www.instagram.com/" }),
   });
   if (!response.ok) throw new Error(`Embed do Instagram respondeu HTTP ${response.status}`);
@@ -332,7 +332,7 @@ async function fetchEmbed(code: string): Promise<{ html: string; node?: Instagra
 async function fetchPublicPage(code: string): Promise<{ html: string; node?: InstagramNode }> {
   const response = await fetch(`https://www.instagram.com/p/${code}/`, {
     redirect: "follow",
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS),
     headers: requestHeaders({ referer: "https://www.instagram.com/" }),
   });
   if (!response.ok) throw new Error(`Página do Instagram respondeu HTTP ${response.status}`);
@@ -346,7 +346,7 @@ async function fetchScraper(code: string): Promise<InstagramNode | undefined> {
   endpoint.searchParams.set("id", code);
   const response = await fetch(endpoint, {
     redirect: "follow",
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(Math.round(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS * 1.5)),
     headers: requestHeaders({ accept: "application/json" }),
   });
   if (!response.ok) throw new Error(`Scraper do Instagram respondeu HTTP ${response.status}`);
@@ -369,7 +369,7 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
   });
   const response = await fetch("https://www.instagram.com/graphql/query", {
     method: "POST",
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(Math.round(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS * 1.5)),
     headers: requestHeaders({
       "content-type": "application/x-www-form-urlencoded",
       "x-csrftoken": instagramCsrfToken() ?? "",

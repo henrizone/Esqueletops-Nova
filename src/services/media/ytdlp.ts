@@ -8,6 +8,7 @@ import type { DownloadedMedia, DownloadMode, MediaMetadata, RemoteMediaItem } fr
 import { downloadWithGalleryDl } from "./gallerydl.js";
 import { downloadInstagramMedia, isInstagramPostUrl, isInstagramReelUrl } from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
+import { downloadTikTokMedia, isTikTokUrl } from "./tiktok.js";
 import { cookieFileForUrl } from "./cookies.js";
 
 interface FormatInfo {
@@ -475,6 +476,16 @@ export async function downloadMedia(url: string, mode: DownloadMode): Promise<Do
     // O extrator dedicado seleciona somente as mídias do tweet principal e
     // mantém o tweet citado apenas como texto. O yt-dlp não garante isso.
     return downloadTwitterMedia(url);
+  }
+
+  // TikTok dedicado (tikwm): retorna a URL direta do MP4, muito mais rápido que
+  // o yt-dlp. Se falhar, seguimos para o yt-dlp/gallery-dl como rede de segurança.
+  if (mode !== "audio" && env.TIKTOK_DIRECT_ENABLED && isTikTokUrl(url)) {
+    try {
+      return await downloadTikTokMedia(url);
+    } catch (error) {
+      logger.info({ url, error }, "Extrator dedicado do TikTok indisponível; caindo no yt-dlp");
+    }
   }
 
   const instagram = mode !== "audio" && isInstagramPostUrl(url);
