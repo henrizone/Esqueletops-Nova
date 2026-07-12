@@ -71,6 +71,24 @@ function remoteUrls(item: RemoteMediaItem) {
   return [item.url, ...(item.fallbackUrls ?? [])].filter((url, index, all) => all.indexOf(url) === index);
 }
 
+/**
+ * Alguns CDNs são públicos e o próprio Telegram consegue baixar a mídia a
+ * partir da URL, sem precisar que o bot faça streaming pelo Node. Isso torna o
+ * envio praticamente instantâneo (o arquivo nunca passa pela nossa máquina).
+ * Só habilitamos para hosts que sabidamente não exigem cabeçalho referer,
+ * como o CDN de vídeo do Twitter/X.
+ */
+function telegramCanFetchDirectly(url: string): boolean {
+  if (!env.REMOTE_FAST_PATH) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    // CDNs públicos que não exigem referer: o Telegram baixa direto.
+    return host.endsWith("twimg.com") || host.endsWith("twitter.com");
+  } catch {
+    return false;
+  }
+}
+
 async function sendOneLocalOrCached(
   ctx: BotContext,
   item: PreparedMediaItem | CachedMediaItem,
@@ -112,7 +130,10 @@ async function sendOneRemote(
   let lastError: unknown;
   for (const url of remoteUrls(item)) {
     try {
-      const media = remoteInput(url, sourceUrl);
+      // Se o Telegram consegue baixar a URL sozinho, passamos a string direta:
+      // o vídeo vai do CDN para o Telegram sem tocar na nossa máquina (instantâneo).
+      // Caso contrário, transmitimos pelo Node com headers de navegador.
+      const media = telegramCanFetchDirectly(url) ? url : remoteInput(url, sourceUrl);
       const common = {
         caption: caption || undefined,
         parse_mode: "HTML" as const,
@@ -126,7 +147,9 @@ async function sendOneRemote(
         width: item.width,
         height: item.height,
         duration: item.duration ? Math.round(item.duration) : undefined,
-        thumbnail: item.thumbnailUrl ? remoteInput(item.thumbnailUrl, sourceUrl) : undefined,
+        thumbnail: item.thumbnailUrl && !telegramCanFetchDirectly(url)
+          ? remoteInput(item.thumbnailUrl, sourceUrl)
+          : undefined,
       });
     } catch (error) {
       lastError = error;
@@ -156,7 +179,7 @@ function cachedAlbumItem(item: CachedMediaItem, options?: { caption: string; par
 }
 
 function remoteAlbumItem(item: RemoteMediaItem, url: string, sourceUrl?: string, options?: { caption: string; parse_mode: "HTML" }) {
-  const media = remoteInput(url, sourceUrl);
+  const media = telegramCanFetchDirectly(url) ? url : remoteInput(url, sourceUrl);
   return item.kind === "photo"
     ? InputMediaBuilder.photo(media, options)
     : InputMediaBuilder.video(media, {
@@ -165,7 +188,9 @@ function remoteAlbumItem(item: RemoteMediaItem, url: string, sourceUrl?: string,
       width: item.width,
       height: item.height,
       duration: item.duration ? Math.round(item.duration) : undefined,
-      thumbnail: item.thumbnailUrl ? remoteInput(item.thumbnailUrl, sourceUrl) : undefined,
+      thumbnail: item.thumbnailUrl && !telegramCanFetchDirectly(url)
+        ? remoteInput(item.thumbnailUrl, sourceUrl)
+        : undefined,
     });
 }
 

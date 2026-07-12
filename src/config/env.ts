@@ -62,6 +62,10 @@ const schema = z.object({
   // Concorrência de preparação de mídia (ffmpeg/sharp). Aumente em máquinas com
   // mais núcleos para preparar álbuns em paralelo.
   MEDIA_PREP_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(3),
+  // Caminho rápido: envia vídeos/fotos remotos já prontos (Twitter/X e a maioria
+  // dos CDNs) direto ao Telegram, sem baixar em disco nem passar pelo FFmpeg.
+  // É o que torna o envio quase instantâneo, como no SmudgeLord.
+  REMOTE_FAST_PATH: bool.default(true),
   MEDIA_CACHE_TTL_SECONDS: z.coerce.number().int().min(60).default(604800),
   MEDIA_PROGRESS_MESSAGES: bool.default(false),
   MEDIA_INCLUDE_SOURCE_LINK: bool.default(true),
