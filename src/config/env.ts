@@ -56,6 +56,12 @@ const schema = z.object({
   // apenas se quiser o comportamento antigo (recodificar tudo).
   VIDEO_ALWAYS_TRANSCODE: bool.default(false),
   VIDEO_MAX_PASSTHROUGH_FPS: z.coerce.number().min(1).max(120).default(61),
+  // Borda máxima (px) que passa sem recodificar. 1920 deixa Reels/TikToks
+  // verticais 1080x1920 e vídeos 1080p passarem com qualidade original.
+  VIDEO_MAX_PASSTHROUGH_EDGE: z.coerce.number().int().min(720).max(4096).default(1920),
+  // Bitrate máximo (bps) quando a recodificação é inevitável (vídeo > limite de
+  // upload). Elevado de 2M para 6M para não pixelar quando precisa recodificar.
+  VIDEO_TRANSCODE_MAX_BITRATE: z.coerce.number().int().min(500_000).max(20_000_000).default(6_000_000),
   VIDEO_TRANSCODE_PRESET: z.enum([
     "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow",
   ]).default("veryfast"),

@@ -107,22 +107,22 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
 
     // CAMINHO RÁPIDO (estilo SmudgeLord): quando o extrator já entrega URLs de
-    // MP4/foto prontos (Twitter/X e a maioria dos CDNs), enviamos direto ao
-    // Telegram sem baixar em disco e sem passar pelo FFmpeg. Isso elimina as
-    // duas etapas mais lentas do fluxo antigo.
+    // MP4/foto prontos (Twitter/X, TikTok via tikwm), enviamos direto ao
+    // Telegram sem baixar em disco e sem passar pelo FFmpeg.
+    //
+    // EXCEÇÃO: Instagram. O Telegram NÃO consegue baixar as URLs do CDN do
+    // Instagram (cdninstagram.com/fbcdn.net) -- retorna erro 400 e trava em
+    // retries. Portanto o Instagram nunca usa o atalho: baixa os bytes pelo bot,
+    // exatamente como o SmudgeLord faz.
+    const isInstagram = isInstagramPostUrl(request.url);
     if (
       env.REMOTE_FAST_PATH
+      && !isInstagram
       && downloaded.remoteItems?.length
       && !downloaded.files.length
       && remoteItemsAreTelegramReady(downloaded.remoteItems)
     ) {
-      const instagramExpectsVideoFast = isInstagramPostUrl(request.url) && (
-        isInstagramReelUrl(request.url)
-        || Boolean(metadata.duration && metadata.duration > 0)
-      );
-      // Segurança: nunca usar o atalho para vídeos do Instagram, cujo fluxo
-      // precisa da verificação de MP4 real feita mais abaixo.
-      if (!instagramExpectsVideoFast) {
+      {
         try {
           const activity = downloaded.remoteItems.some((item) => item.kind === "video")
             ? "upload_video" as const

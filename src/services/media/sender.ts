@@ -72,6 +72,23 @@ function remoteUrls(item: RemoteMediaItem) {
 }
 
 /**
+ * Detecta o erro do Telegram quando ele NÃO consegue baixar a mídia a partir da
+ * URL ("Wrong file identifier/HTTP URL specified"). Nesse caso não adianta
+ * repetir com a mesma URL: o certo é cair no download em bytes imediatamente.
+ */
+function telegramRejectedRemoteUrl(error: unknown): boolean {
+  const description = String(
+    (error as { description?: string })?.description
+    ?? (error as { message?: string })?.message
+    ?? error,
+  ).toLowerCase();
+  return description.includes("wrong file identifier")
+    || description.includes("wrong type of the web page content")
+    || description.includes("failed to get http url content")
+    || description.includes("wrong remote file");
+}
+
+/**
  * Alguns CDNs são públicos e o próprio Telegram consegue baixar a mídia a
  * partir da URL, sem precisar que o bot faça streaming pelo Node. Isso torna o
  * envio praticamente instantâneo (o arquivo nunca passa pela nossa máquina).
@@ -86,25 +103,18 @@ function remoteUrls(item: RemoteMediaItem) {
  * (separada por vírgulas) sem recompilar.
  */
 const DEFAULT_DIRECT_CDN_HOSTS = [
-  // Twitter / X
+  // Twitter / X -- comprovadamente aceitos pelo Telegram sem referer.
   "twimg.com",
   "twitter.com",
-  // Instagram / Facebook CDN
-  "cdninstagram.com",
-  "fbcdn.net",
-  // TikTok / ByteDance CDNs
-  "tiktokcdn.com",
-  "tiktokcdn-us.com",
-  "tiktokcdn-eu.com",
-  "muscdn.com",
-  "byteoversea.com",
-  "ibytedtos.com",
-  "ipstatp.com",
   // Reddit
   "redd.it",
   "redditmedia.com",
   // Proxy do extrator de TikTok (tikwm) -- URLs públicas, sem referer.
   "tikwm.com",
+  // ATENÇÃO: NÃO adicionar cdninstagram.com / fbcdn.net aqui. O Telegram
+  // RECUSA essas URLs (erro 400 "Wrong file identifier/HTTP URL specified"),
+  // porque elas exigem headers/assinatura que ele não envia. O Instagram é
+  // sempre baixado em bytes pelo bot (como o SmudgeLord faz), nunca por URL.
 ];
 
 function directCdnHosts(): string[] {
@@ -319,6 +329,13 @@ async function sendRemoteAlbumChunk(
       });
     } catch (error) {
       lastError = error;
+      // Se o Telegram RECUSA a URL (não consegue baixar do CDN), tentar de novo
+      // com a mesma URL é inútil -- vai falhar igual. Aborta já para cair no
+      // download em bytes, sem gastar 4 tentativas (que somam dezenas de segundos).
+      if (telegramRejectedRemoteUrl(error)) {
+        logger.warn({ error, url: sourceUrl }, "Telegram recusou a URL remota; indo direto ao download em bytes");
+        throw error;
+      }
       logger.warn({ error, attempt: attempt + 1 }, "Falha ao enviar álbum remoto; tentando variantes menores");
     }
   }

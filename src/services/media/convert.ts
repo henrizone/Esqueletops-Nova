@@ -19,9 +19,16 @@ const audioExtensions = new Set([".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav"
 export const TELEGRAM_PHOTO_EXTENSION = ".jpg";
 export const TELEGRAM_VIDEO_EXTENSION = ".mp4";
 export const TELEGRAM_VIDEO_FPS = 30;
-export const TELEGRAM_VIDEO_MAX_EDGE = 1280;
+// Vídeos até esta borda passam SEM recodificar (stream copy), preservando a
+// qualidade original -- como o SmudgeLord, que nunca re-encoda vídeo. Antes era
+// 1280, o que forçava recodificação de qualquer vídeo 1080p+ (a maioria de
+// Reels/TikToks verticais é 1080x1920) e deixava tudo pixelado. Configurável em
+// VIDEO_MAX_PASSTHROUGH_EDGE.
+export const TELEGRAM_VIDEO_MAX_EDGE = env.VIDEO_MAX_PASSTHROUGH_EDGE;
 export const TELEGRAM_VIDEO_AUDIO_BITRATE = 128_000;
-export const TELEGRAM_VIDEO_MAX_BITRATE = 2_000_000;
+// Só usado quando REALMENTE precisa recodificar (vídeo grande demais). Elevado
+// para não estourar a qualidade quando a recodificação é inevitável.
+export const TELEGRAM_VIDEO_MAX_BITRATE = env.VIDEO_TRANSCODE_MAX_BITRATE;
 
 async function isAnimatedImage(path: string, mime: string) {
   if (mime === "image/gif" || extname(path).toLowerCase() === ".gif") return true;

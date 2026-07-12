@@ -109,9 +109,11 @@ function remoteItemsFromData(data: TikwmData): RemoteMediaItem[] {
       .map((url) => ({ url, kind: "photo" as const }));
   }
 
-  // Vídeo: preferimos hdplay > play (ambos sem marca d'água); wmplay é o último
-  // recurso (tem marca d'água) só para não falhar.
-  const videoUrls = unique([data.hdplay, data.play, data.wmplay]);
+  // Vídeo sem marca d'água. Preferimos `play` (qualidade padrão, JÁ pronto no
+  // tikwm = rápido) em vez de `hdplay` (HD gerado sob demanda = mais lento).
+  // O SmudgeLord também prioriza velocidade aqui. `hdplay` fica como fallback
+  // (melhor qualidade se o play falhar) e `wmplay` (com marca) como último caso.
+  const videoUrls = unique([data.play, data.hdplay, data.wmplay]);
   if (!videoUrls.length) return [];
 
   const [primary, ...fallbacks] = videoUrls;
@@ -129,7 +131,8 @@ function remoteItemsFromData(data: TikwmData): RemoteMediaItem[] {
 async function fetchTikwm(rawUrl: string): Promise<TikwmData> {
   const endpoint = new URL(env.TIKTOK_API_URL);
   endpoint.searchParams.set("url", rawUrl);
-  endpoint.searchParams.set("hd", "1");
+  // Sem hd=1: pedir HD faz o tikwm gerar o arquivo sob demanda (lento). Como
+  // priorizamos o `play` (já pronto), a resposta vem bem mais rápido.
 
   const response = await fetch(endpoint.toString(), {
     redirect: "follow",
