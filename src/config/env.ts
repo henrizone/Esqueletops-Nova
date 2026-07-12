@@ -51,6 +51,17 @@ const schema = z.object({
   DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
   DOWNLOAD_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(0),
   DOWNLOAD_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(3600).default(180),
+  // Desempenho de vídeo: por padrão, vídeos já compatíveis com o Telegram são
+  // apenas remuxados (stream copy), sem recodificar. Ligue VIDEO_ALWAYS_TRANSCODE
+  // apenas se quiser o comportamento antigo (recodificar tudo).
+  VIDEO_ALWAYS_TRANSCODE: bool.default(false),
+  VIDEO_MAX_PASSTHROUGH_FPS: z.coerce.number().min(1).max(120).default(61),
+  VIDEO_TRANSCODE_PRESET: z.enum([
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow",
+  ]).default("veryfast"),
+  // Concorrência de preparação de mídia (ffmpeg/sharp). Aumente em máquinas com
+  // mais núcleos para preparar álbuns em paralelo.
+  MEDIA_PREP_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(3),
   MEDIA_CACHE_TTL_SECONDS: z.coerce.number().int().min(60).default(604800),
   MEDIA_PROGRESS_MESSAGES: bool.default(false),
   MEDIA_INCLUDE_SOURCE_LINK: bool.default(true),

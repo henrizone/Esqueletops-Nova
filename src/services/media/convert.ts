@@ -234,6 +234,77 @@ interface NormalizedVideo {
   duration: number;
 }
 
+function avgFps(stream: ProbeStream) {
+  const raw = stream.avg_frame_rate ?? stream.r_frame_rate ?? "";
+  const ratio = parseRatio(raw);
+  if (ratio && Number.isFinite(ratio) && ratio > 0) return ratio;
+  const single = Number(raw);
+  return Number.isFinite(single) && single > 0 ? single : 0;
+}
+
+/**
+ * Decide se o vídeo já está no perfil que o Telegram entende sem qualquer
+ * recodificação. Se estiver, o arquivo é apenas remuxado (stream copy) para
+ * garantir +faststart, o que leva milissegundos em vez de segundos de CPU.
+ * Esse é o mesmo princípio do SmudgeLord, que sempre usa "-c copy".
+ */
+function isTelegramReadyVideo(stream: ProbeStream, size: number): boolean {
+  if (env.VIDEO_ALWAYS_TRANSCODE) return false;
+
+  const codec = (stream.codec_name ?? "").toLowerCase();
+  if (codec !== "h264" && codec !== "avc1") return false;
+
+  const pixFmt = (stream.pix_fmt ?? "").toLowerCase();
+  if (pixFmt && pixFmt !== "yuv420p" && pixFmt !== "yuvj420p") return false;
+
+  const rotation = rotationFromStream(stream);
+  if (rotation !== 0) return false;
+
+  // SAR diferente de 1 significa que o vídeo é anamórfico e apareceria espremido
+  // sem o passo de escala; nesse caso vale recodificar.
+  const sar = parseRatio(stream.sample_aspect_ratio);
+  if (sar !== undefined && Math.abs(sar - 1) > 0.01) return false;
+
+  const width = stream.width ?? 0;
+  const height = stream.height ?? 0;
+  if (width <= 0 || height <= 0) return false;
+  if (Math.max(width, height) > TELEGRAM_VIDEO_MAX_EDGE) return false;
+  if (width % 2 !== 0 || height % 2 !== 0) return false;
+
+  const fps = avgFps(stream);
+  if (fps > env.VIDEO_MAX_PASSTHROUGH_FPS) return false;
+
+  if (size > env.MAX_UPLOAD_BYTES) return false;
+
+  return true;
+}
+
+/**
+ * Remux rápido: copia os streams de vídeo/áudio sem recodificar, apenas
+ * reescreve o container para MP4 com faststart e remove metadados de rotação
+ * problemáticos. Custa quase nada de CPU.
+ */
+async function remuxVideo(input: string, dimensions: VideoDimensions, duration: number): Promise<NormalizedVideo> {
+  const output = videoOutput(input);
+  await execa(env.FFMPEG_BINARY, [
+    "-y",
+    "-i", input,
+    "-map", "0:v:0",
+    "-map", "0:a?",
+    "-map_metadata", "-1",
+    "-map_chapters", "-1",
+    "-sn",
+    "-dn",
+    "-c", "copy",
+    "-metadata:s:v:0", "rotate=0",
+    "-movflags", "+faststart",
+    "-max_muxing_queue_size", "2048",
+    "-f", "mp4",
+    output,
+  ], { timeout: env.DOWNLOAD_TIMEOUT_SECONDS * 1000 });
+  return { path: output, width: dimensions.width, height: dimensions.height, duration };
+}
+
 async function transcodeVideo(
   input: string,
   output: string,
@@ -254,7 +325,7 @@ async function transcodeVideo(
     "-dn",
     "-vf", telegramVideoFilter(dimensions),
     "-c:v", "libx264",
-    "-preset", "veryfast",
+    "-preset", env.VIDEO_TRANSCODE_PRESET,
     "-b:v", String(videoBitrate),
     "-maxrate", String(Math.floor(videoBitrate * 1.12)),
     "-bufsize", String(videoBitrate * 2),
@@ -277,10 +348,12 @@ async function transcodeVideo(
 }
 
 /**
- * Todo vídeo, Reel, GIF ou imagem animada passa pelo mesmo perfil final:
- * MP4/H.264/AAC, 30 fps, pixels quadrados, proporção visual preservada e
- * bitrate reduzido. A recodificação única remove metadados que fazem o vídeo
- * aparecer espremido no Telegram para iOS.
+ * Todo vídeo, Reel, GIF ou imagem animada passa por esta etapa. Quando o
+ * arquivo já está no perfil MP4/H.264/AAC compatível, ele é apenas remuxado
+ * (stream copy) — praticamente instantâneo. A recodificação completa só
+ * acontece quando algo realmente precisa mudar (codec, resolução, fps,
+ * rotação, anamorfismo ou tamanho acima do limite), removendo metadados que
+ * fazem o vídeo aparecer espremido no Telegram para iOS.
  */
 async function normalizeVideo(input: string): Promise<NormalizedVideo> {
   const output = videoOutput(input);
@@ -290,6 +363,25 @@ async function normalizeVideo(input: string): Promise<NormalizedVideo> {
 
   if (!video) throw new Error("Arquivo classificado como vídeo não possui stream de vídeo");
 
+  const size = await fileSize(input).catch(() => Number.POSITIVE_INFINITY);
+
+  if (isTelegramReadyVideo(video, size)) {
+    const dimensions = targetVideoDimensions(video);
+    try {
+      const remuxed = await remuxVideo(input, dimensions, duration);
+      logger.debug({
+        input,
+        output: remuxed.path,
+        width: remuxed.width,
+        height: remuxed.height,
+        mode: "remux",
+      }, "Vídeo já compatível: apenas remuxado (stream copy)");
+      return remuxed;
+    } catch (error) {
+      logger.warn({ input, error }, "Remux rápido falhou; recodificando o vídeo");
+    }
+  }
+
   const normalized = await transcodeVideo(input, output, video, duration);
   logger.debug({
     input,
@@ -298,6 +390,7 @@ async function normalizeVideo(input: string): Promise<NormalizedVideo> {
     height: normalized.height,
     fps: TELEGRAM_VIDEO_FPS,
     bitrate: targetVideoBitrate(normalized.width, normalized.height, duration),
+    mode: "transcode",
   }, "Vídeo convertido para o perfil universal do Telegram");
   return normalized;
 }
@@ -340,11 +433,18 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
     if (kind === "photo") {
       path = await normalizePhoto(path);
     } else if (kind === "video") {
-      const normalized = await normalizeVideo(path);
-      path = normalized.path;
-      width = normalized.width;
-      height = normalized.height;
-      duration = normalized.duration;
+      // Acima do limite: força uma recodificação real (o remux não reduz tamanho).
+      const output = videoOutput(path);
+      const probe = await probeMedia(path);
+      const stream = probe.streams?.find((s) => s.codec_type === "video");
+      const dur = durationFromProbe(probe);
+      if (stream) {
+        const normalized = await transcodeVideo(path, output, stream, dur);
+        path = normalized.path;
+        width = normalized.width;
+        height = normalized.height;
+        duration = normalized.duration;
+      }
     } else if (kind === "audio") {
       path = await convertAudio(path);
     }
@@ -386,7 +486,7 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
  * responder rápido sem saturar CPU/RAM do container.
  */
 export async function prepareMediaFiles(paths: string[]): Promise<PreparedMediaItem[]> {
-  const queue = new PQueue({ concurrency: Math.min(env.DOWNLOAD_CONCURRENCY, 2) });
+  const queue = new PQueue({ concurrency: Math.max(1, env.MEDIA_PREP_CONCURRENCY) });
   const prepared = await Promise.all(paths.map((path) => queue.add(() => prepareOneMediaFile(path))));
   return prepared.filter((item): item is PreparedMediaItem => Boolean(item));
 }
