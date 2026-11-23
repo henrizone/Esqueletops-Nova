@@ -15,6 +15,13 @@ import { env } from "./config/env.js";
 import { logger } from "./config/logger.js";
 import { closeDatabase, connectDatabase, db } from "./database/index.js";
 import { cookieConfigurationStatus } from "./services/media/cookies.js";
+import {
+  registerWhatsAppWebhook,
+  webhookSecret,
+  whatsAppEnabled,
+  WHATSAPP_WEBHOOK_PATH,
+} from "./services/whatsapp/evolution.js";
+import { handleEvolutionWebhook } from "./services/whatsapp/handler.js";
 
 const app = Fastify({ logger: false, bodyLimit: 20 * 1024 * 1024 });
 let ready = false;
@@ -63,6 +70,24 @@ if (env.RUN_MODE === "webhook") {
     await bot.handleUpdate(request.body);
     return { ok: true };
   });
+}
+
+if (whatsAppEnabled()) {
+  // A Evolution pode acrescentar o nome do evento ao caminho (webhook por
+  // evento), por isso a rota aceita um sufixo opcional.
+  const handler = async (
+    request: { query: unknown; headers: Record<string, unknown>; body: unknown },
+    reply: { code: (status: number) => { send: (payload: unknown) => unknown } },
+  ) => {
+    const token = (request.query as { token?: string } | undefined)?.token
+      ?? request.headers["x-webhook-token"];
+    if (token !== webhookSecret()) return reply.code(401).send({ ok: false });
+    // Responde imediatamente; o download roda em segundo plano para a
+    // Evolution não reenviar o evento por timeout.
+    return { ok: true, accepted: handleEvolutionWebhook(request.body) };
+  };
+  app.post(WHATSAPP_WEBHOOK_PATH, handler as never);
+  app.post(`${WHATSAPP_WEBHOOK_PATH}/*`, handler as never);
 }
 
 async function clearPollingLock() {
@@ -207,6 +232,16 @@ async function main() {
 
   await app.listen({ host: env.HOST, port: env.PORT });
   logger.info({ host: env.HOST, port: env.PORT }, "Servidor de healthcheck iniciado");
+
+  if (whatsAppEnabled()) {
+    // Uma falha aqui não derruba o bot do Telegram.
+    await registerWhatsAppWebhook().then(
+      (url) => logger.info({ webhook: url, instance: env.EVOLUTION_INSTANCE }, url
+        ? "WhatsApp (Evolution API) ativo"
+        : "WhatsApp ativo, mas o webhook não foi registrado automaticamente"),
+      (error) => logger.error({ error }, "Não foi possível registrar o webhook na Evolution API"),
+    );
+  }
 
   if (env.RUN_MODE === "webhook") {
     const webhookUrl = `${env.WEBHOOK_URL!.replace(/\/$/, "")}/telegram`;

@@ -107,6 +107,30 @@ const schema = z.object({
   // de cada tweet, com botão), igual ao SmudgeLord. Desligue para usar álbum.
   MEDIA_ARTICLES: bool.default(true),
   DELETE_TEMP_FILES: bool.default(true),
+  // ---- WhatsApp via Evolution API -------------------------------------------
+  // O canal liga sozinho quando URL, chave e instância estão preenchidas.
+  WHATSAPP_ENABLED: bool.default(true),
+  EVOLUTION_API_URL: optional,
+  EVOLUTION_API_KEY: optional,
+  EVOLUTION_INSTANCE: optional,
+  // Endereço público deste servidor; usado para registrar o webhook na Evolution.
+  SERVER_URL: optional,
+  WHATSAPP_WEBHOOK_SECRET: optional,
+  // Proteções contra banimento do número.
+  WHATSAPP_MAX_MEDIA: z.coerce.number().int().min(1).max(10).default(4),
+  WHATSAPP_USER_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(20),
+  WHATSAPP_CHAT_HOURLY_LIMIT: z.coerce.number().int().min(1).max(1000).default(15),
+  WHATSAPP_GLOBAL_HOURLY_LIMIT: z.coerce.number().int().min(1).max(10000).default(120),
+  WHATSAPP_MIN_DELAY_MS: z.coerce.number().int().min(0).max(60000).default(1500),
+  WHATSAPP_MAX_DELAY_MS: z.coerce.number().int().min(0).max(120000).default(4000),
+  WHATSAPP_MAX_MESSAGE_AGE_SECONDS: z.coerce.number().int().min(10).max(86400).default(180),
+  WHATSAPP_MAX_QUEUE: z.coerce.number().int().min(1).max(1000).default(20),
+  WHATSAPP_GROUPS: bool.default(true),
+  // Lista opcional de chats atendidos (números ou JIDs, separados por vírgula).
+  WHATSAPP_ALLOWED_CHATS: z.string().default(""),
+  // Acima disso o vídeo vai como documento; acima do limite de arquivo é omitido.
+  WHATSAPP_MAX_VIDEO_MB: z.coerce.number().min(1).max(2000).default(16),
+  WHATSAPP_MAX_FILE_MB: z.coerce.number().min(1).max(2000).default(49),
   TRANSLATE_PROVIDER: z.enum(["google", "libretranslate"]).default("google"),
   LIBRETRANSLATE_URL: optional,
   LIBRETRANSLATE_API_KEY: optional,
@@ -128,5 +152,8 @@ export const env = {
   OWNER_IDS: owners,
   LOG_CHANNEL_ID: logChannel,
   MAX_UPLOAD_BYTES: Math.floor(parsed.data.MAX_UPLOAD_MB * 1024 * 1024),
+  WHATSAPP_MAX_VIDEO_BYTES: Math.floor(parsed.data.WHATSAPP_MAX_VIDEO_MB * 1024 * 1024),
+  WHATSAPP_MAX_FILE_BYTES: Math.floor(parsed.data.WHATSAPP_MAX_FILE_MB * 1024 * 1024),
+  WHATSAPP_ALLOWED_CHAT_LIST: parsed.data.WHATSAPP_ALLOWED_CHATS.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
   EXTRA_ALLOWED_DOMAINS: parsed.data.MEDIA_ALLOWED_DOMAINS.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
 } as const;

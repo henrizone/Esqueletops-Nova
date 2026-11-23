@@ -385,6 +385,14 @@ npm test
 | `MAX_MEDIA_ITEMS`            |                 `20` | Máximo de itens por publicação (álbuns de 10) |
 | `TIKTOK_HD`                  |               `true` | Usa a versão HD do TikTok como principal  |
 | `MEDIA_ARTICLES`             |               `true` | Tweets com quote em uma única rich message (estilo SmudgeLord) |
+| `EVOLUTION_API_URL` / `EVOLUTION_API_KEY` / `EVOLUTION_INSTANCE` | vazio | Ligam o canal WhatsApp via Evolution API (v2) |
+| `SERVER_URL`                 |                vazio | URL pública deste servidor; usada para registrar o webhook `/whatsapp/webhook` |
+| `WHATSAPP_MAX_MEDIA`         |                  `4` | Máximo de mídias por link no WhatsApp     |
+| `WHATSAPP_USER_COOLDOWN_SECONDS` |             `20` | Intervalo mínimo entre pedidos da mesma pessoa |
+| `WHATSAPP_CHAT_HOURLY_LIMIT` / `WHATSAPP_GLOBAL_HOURLY_LIMIT` | `15` / `120` | Teto de links atendidos por hora (por chat / no número) |
+| `WHATSAPP_MIN_DELAY_MS` / `WHATSAPP_MAX_DELAY_MS` | `1500` / `4000` | Pausa aleatória antes e entre envios      |
+| `WHATSAPP_GROUPS`            |               `true` | Responde também em grupos                 |
+| `WHATSAPP_ALLOWED_CHATS`     |                vazio | Se preenchida, só atende esses números/JIDs |
 | `REMOTE_DOWNLOAD_CONCURRENCY` |                 `6` | Downloads simultâneos de um mesmo álbum   |
 | `INSTAGRAM_HEDGE_DELAY_MS`   |                `900` | Espera antes de acionar a próxima fonte do Instagram |
 | `TWITTER_ATTEMPT_TIMEOUT_MS` |               `8000` | Timeout por consulta ao X/Twitter         |

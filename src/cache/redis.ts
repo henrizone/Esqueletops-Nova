@@ -26,4 +26,15 @@ export async function renewLock(raw: string, token: string, ttl: number): Promis
   const result = await redis.eval('if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("expire", KEYS[1], ARGV[2]) else return 0 end', 1, key(`lock:${raw}`), token, String(ttl));
   return Number(result) === 1;
 }
+/** Marca uma chave como vista. Devolve false se ela já existia (evento repetido). */
+export async function claimOnce(raw: string, ttl: number): Promise<boolean> {
+  return await redis.set(key(`once:${raw}`), "1", "EX", ttl, "NX") === "OK";
+}
+/** Contador em janela fixa: incrementa e devolve o total dentro da janela de `ttl` segundos. */
+export async function incrementWindow(raw: string, ttl: number): Promise<number> {
+  const k = key(`window:${raw}`);
+  const count = await redis.incr(k);
+  if (count === 1) await redis.expire(k, ttl);
+  return count;
+}
 export async function consumeCooldown(raw: string, ttl: number): Promise<number> { if (ttl <= 0) return 0; const k = key(`cooldown:${raw}`); if (await redis.set(k, "1", "EX", ttl, "NX") === "OK") return 0; return Math.max(await redis.ttl(k), 1); }
