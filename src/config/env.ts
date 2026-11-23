@@ -126,6 +126,10 @@ const schema = z.object({
   WHATSAPP_MAX_MESSAGE_AGE_SECONDS: z.coerce.number().int().min(10).max(86400).default(180),
   WHATSAPP_MAX_QUEUE: z.coerce.number().int().min(1).max(1000).default(20),
   WHATSAPP_GROUPS: bool.default(true),
+  // /fig: figurinha avulsa a partir de foto, GIF ou vídeo curto.
+  WHATSAPP_STICKERS: bool.default(true),
+  WHATSAPP_STICKER_MAX_SECONDS: z.coerce.number().int().min(1).max(10).default(8),
+  WHATSAPP_STICKER_MAX_INPUT_MB: z.coerce.number().min(1).max(100).default(20),
   // Lista opcional de chats atendidos (números ou JIDs, separados por vírgula).
   WHATSAPP_ALLOWED_CHATS: z.string().default(""),
   // Vídeo acima deste tamanho é comprimido para caber e continuar chegando
@@ -155,6 +159,7 @@ export const env = {
   MAX_UPLOAD_BYTES: Math.floor(parsed.data.MAX_UPLOAD_MB * 1024 * 1024),
   WHATSAPP_MAX_VIDEO_BYTES: Math.floor(parsed.data.WHATSAPP_MAX_VIDEO_MB * 1024 * 1024),
   WHATSAPP_MAX_FILE_BYTES: Math.floor(parsed.data.WHATSAPP_MAX_FILE_MB * 1024 * 1024),
+  WHATSAPP_STICKER_MAX_INPUT_BYTES: Math.floor(parsed.data.WHATSAPP_STICKER_MAX_INPUT_MB * 1024 * 1024),
   WHATSAPP_ALLOWED_CHAT_LIST: parsed.data.WHATSAPP_ALLOWED_CHATS.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
   EXTRA_ALLOWED_DOMAINS: parsed.data.MEDIA_ALLOWED_DOMAINS.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
 } as const;

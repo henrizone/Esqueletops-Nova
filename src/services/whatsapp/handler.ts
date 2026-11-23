@@ -11,12 +11,16 @@ import type { PreparedMediaItem } from "../media/types.js";
 import { extractUrls, isAllowedMediaUrl, isAutoMediaUrl, isYouTubeShortsUrl, normalizeUrl } from "../media/urls.js";
 import { downloadMedia } from "../media/ytdlp.js";
 import {
+  fetchWhatsAppMedia,
   sendWhatsAppMedia,
+  sendWhatsAppSticker,
   sendWhatsAppText,
   type WhatsAppMediaType,
   type WhatsAppQuoted,
+  type WhatsAppRawMessage,
 } from "./evolution.js";
 import { buildWhatsAppCaption, htmlToWhatsApp } from "./format.js";
+import { buildWhatsAppSticker, parseFigCommand, stickerName, type FigCommand } from "./sticker.js";
 
 /** Mensagem recebida já normalizada a partir do webhook da Evolution. */
 export interface IncomingWhatsAppMessage {
@@ -27,6 +31,18 @@ export interface IncomingWhatsAppMessage {
   isGroup: boolean;
   text: string;
   timestamp?: number;
+  /** Nome de perfil de quem enviou. */
+  senderName?: string;
+  /** Imagem/vídeo/figurinha que pode virar figurinha: da própria mensagem ou da mensagem respondida. */
+  stickerSource?: WhatsAppStickerSource;
+}
+
+export interface WhatsAppStickerSource {
+  kind: "image" | "video" | "sticker";
+  raw: WhatsAppRawMessage;
+  /** Duração (s) e tamanho (bytes) declarados pelo WhatsApp, quando houver. */
+  seconds?: number;
+  bytes?: number;
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -60,12 +76,50 @@ function fileNameFor(item: PreparedMediaItem, index: number): string {
 /* Leitura do webhook                                                        */
 /* ------------------------------------------------------------------------ */
 
-function messageText(message: any): string {
-  if (!message || typeof message !== "object") return "";
-  const inner = message.ephemeralMessage?.message
+function unwrapMessage(message: any): any {
+  if (!message || typeof message !== "object") return undefined;
+  return message.ephemeralMessage?.message
     ?? message.viewOnceMessage?.message
     ?? message.viewOnceMessageV2?.message
     ?? message;
+}
+
+function mediaSource(message: any, key: Record<string, unknown>): WhatsAppStickerSource | undefined {
+  const inner = unwrapMessage(message);
+  if (!inner) return undefined;
+  const kinds = [["imageMessage", "image"], ["videoMessage", "video"], ["stickerMessage", "sticker"]] as const;
+  for (const [field, kind] of kinds) {
+    const media = inner[field];
+    if (!media) continue;
+    return {
+      kind,
+      raw: { key, message: { [field]: media } },
+      seconds: Number(media.seconds) || undefined,
+      bytes: Number(media.fileLength?.low ?? media.fileLength) || undefined,
+    };
+  }
+  return undefined;
+}
+
+/** Mídia da mensagem respondida (quando o usuário responde uma foto com /fig). */
+function quotedMediaSource(entry: any, remoteJid: string): WhatsAppStickerSource | undefined {
+  const inner = unwrapMessage(entry?.message) ?? {};
+  const context = entry?.contextInfo
+    ?? inner.extendedTextMessage?.contextInfo
+    ?? inner.imageMessage?.contextInfo
+    ?? inner.videoMessage?.contextInfo;
+  if (!context?.quotedMessage || !context.stanzaId) return undefined;
+  return mediaSource(context.quotedMessage, {
+    id: String(context.stanzaId),
+    remoteJid,
+    fromMe: false,
+    ...(context.participant ? { participant: String(context.participant) } : {}),
+  });
+}
+
+function messageText(message: any): string {
+  const inner = unwrapMessage(message);
+  if (!inner) return "";
   return String(
     inner.conversation
     ?? inner.extendedTextMessage?.text
@@ -95,6 +149,10 @@ export function parseEvolutionWebhook(body: any): IncomingWhatsAppMessage[] {
     if (remoteJid === "status@broadcast" || /@(?:broadcast|newsletter)$/i.test(remoteJid)) continue;
     const text = messageText(entry.message).trim();
     if (!text) continue;
+    // A Evolution acrescenta campos próprios à chave; para citar e baixar a
+    // mídia interessa só o que o WhatsApp entende.
+    const cleanKey: Record<string, unknown> = { id: String(key.id), remoteJid, fromMe: false };
+    if (key.participant) cleanKey.participant = String(key.participant);
     const isGroup = remoteJid.endsWith("@g.us");
     messages.push({
       id: String(key.id),
@@ -103,6 +161,8 @@ export function parseEvolutionWebhook(body: any): IncomingWhatsAppMessage[] {
       isGroup,
       text,
       timestamp: Number(entry.messageTimestamp) || undefined,
+      senderName: typeof entry.pushName === "string" && entry.pushName.trim() ? entry.pushName.trim() : undefined,
+      stickerSource: mediaSource(entry.message, cleanKey) ?? quotedMediaSource(entry, remoteJid),
     });
   }
   return messages;
@@ -288,12 +348,96 @@ async function processLink(message: IncomingWhatsAppMessage, rawUrl: string) {
   }
 }
 
+/* ------------------------------------------------------------------------ */
+/* /fig — figurinha avulsa (exclusivo do WhatsApp)                           */
+/* ------------------------------------------------------------------------ */
+
+const FIG_USAGE = "Envie uma foto, GIF ou vídeo curto com a legenda */fig* (ou responda a mídia com */fig*).\nPara dar nome: */fig nome da figurinha*";
+
+async function replyText(message: IncomingWhatsAppMessage, text: string) {
+  await sendQueue.add(() => sendWhatsAppText({
+    number: message.remoteJid,
+    text,
+    delay: typingDelay(),
+    quoted: quotedFor(message),
+  })).catch((error) => logger.warn({ error }, "WhatsApp: falha ao enviar aviso"));
+}
+
+async function processSticker(message: IncomingWhatsAppMessage, command: FigCommand, source: WhatsAppStickerSource) {
+  const startedAt = Date.now();
+  try {
+    if ((source.bytes ?? 0) > env.WHATSAPP_STICKER_MAX_INPUT_BYTES) {
+      await replyText(message, "Essa mídia é grande demais para virar figurinha.");
+      return;
+    }
+    const media = await fetchWhatsAppMedia(source.raw);
+    if (media.buffer.length > env.WHATSAPP_STICKER_MAX_INPUT_BYTES) {
+      await replyText(message, "Essa mídia é grande demais para virar figurinha.");
+      return;
+    }
+    const mimetype = source.kind === "video" ? "video/mp4" : media.mimetype;
+    const sticker = await buildWhatsAppSticker(media.buffer, mimetype, {
+      name: stickerName(command.name, message.senderName),
+      author: env.BOT_DISPLAY_NAME,
+    });
+    await sendQueue.add(async () => {
+      await sendWhatsAppSticker({
+        number: message.remoteJid,
+        sticker: sticker.webp.toString("base64"),
+        delay: typingDelay(),
+        quoted: quotedFor(message),
+      });
+      await sleep(randomBetween(env.WHATSAPP_MIN_DELAY_MS, env.WHATSAPP_MAX_DELAY_MS));
+    });
+    logger.info({
+      chat: message.remoteJid,
+      durationMs: Date.now() - startedAt,
+      animated: sticker.animated,
+      bytes: sticker.webp.length,
+    }, "WhatsApp: figurinha enviada");
+  } catch (error) {
+    logger.error({ error, chat: message.remoteJid }, "WhatsApp: falha ao criar figurinha");
+    // Um único aviso, e só para quem digitou o comando com barra.
+    if (command.explicit) await replyText(message, "Não consegui criar a figurinha com essa mídia.");
+  }
+}
+
+/**
+ * Trata /fig. Devolve true quando a mensagem era o comando (mesmo que tenha
+ * sido recusada pelos limites), para não cair no fluxo de links.
+ */
+async function handleFigCommand(message: IncomingWhatsAppMessage): Promise<boolean> {
+  if (!env.WHATSAPP_STICKERS) return false;
+  const command = parseFigCommand(message.text);
+  if (!command) return false;
+  const source = message.stickerSource;
+  // "fig" sem barra e sem mídia é só conversa: ignora em silêncio.
+  if (!source && !command.explicit) return false;
+
+  const refusal = await admit(message);
+  if (refusal) {
+    logger.debug({ chat: message.remoteJid, reason: refusal }, "WhatsApp: /fig não atendido");
+    return true;
+  }
+  if (!source) {
+    await replyText(message, FIG_USAGE);
+    return true;
+  }
+  if (workQueue.size >= env.WHATSAPP_MAX_QUEUE) {
+    logger.warn({ chat: message.remoteJid }, "WhatsApp: fila cheia; /fig ignorado");
+    return true;
+  }
+  void workQueue.add(() => processSticker(message, command, source));
+  return true;
+}
+
 /** Primeiro link suportado da mensagem; os demais são ignorados de propósito. */
 export function firstSupportedUrl(text: string): string | undefined {
   return extractUrls(text).filter(isAllowedMediaUrl).find(isAutoMediaUrl);
 }
 
 export async function handleIncomingWhatsApp(message: IncomingWhatsAppMessage): Promise<void> {
+  if (await handleFigCommand(message)) return;
   const url = firstSupportedUrl(message.text);
   if (!url) return;
   const refusal = await admit(message);

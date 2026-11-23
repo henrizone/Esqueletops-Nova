@@ -78,6 +78,42 @@ export async function sendWhatsAppMedia(payload: WhatsAppMediaPayload): Promise<
   await request("message/sendMedia", payload, Math.max(60_000, env.DOWNLOAD_TIMEOUT_SECONDS * 1000));
 }
 
+/** Mensagem crua do WhatsApp (chave + conteúdo), como chega no webhook. */
+export interface WhatsAppRawMessage {
+  key: Record<string, unknown>;
+  message?: Record<string, unknown>;
+}
+
+/**
+ * Baixa e descriptografa a mídia de uma mensagem. Enviar o conteúdo completo
+ * dispensa a Evolution de ter a mensagem salva no banco; se isso falhar, tenta
+ * de novo só com a chave (busca no histórico da instância).
+ */
+export async function fetchWhatsAppMedia(raw: WhatsAppRawMessage): Promise<{ buffer: Buffer; mimetype: string }> {
+  type MediaResponse = { base64?: string; mimetype?: string };
+  let response: MediaResponse | undefined;
+  try {
+    response = await request<MediaResponse>("chat/getBase64FromMediaMessage", { message: raw, convertToMp4: false }, 90_000);
+  } catch (error) {
+    if (!raw.message) throw error;
+    response = await request<MediaResponse>("chat/getBase64FromMediaMessage", { message: { key: raw.key }, convertToMp4: false }, 90_000);
+  }
+  if (!response?.base64) throw new Error("Evolution API não devolveu a mídia da mensagem");
+  return { buffer: Buffer.from(response.base64, "base64"), mimetype: response.mimetype ?? "application/octet-stream" };
+}
+
+export async function sendWhatsAppSticker(input: {
+  number: string;
+  /** WebP já pronto, em base64. */
+  sticker: string;
+  delay?: number;
+  quoted?: WhatsAppQuoted;
+}): Promise<void> {
+  // notConvertSticker: a Evolution envia o WebP como está. Sem isso ela
+  // recodifica a imagem e apaga o nome gravado na figurinha.
+  await request("message/sendSticker", { ...input, notConvertSticker: true }, 90_000);
+}
+
 /**
  * Aponta o webhook da instância para este servidor, pedindo apenas o evento
  * de mensagens recebidas. Tenta o formato da Evolution v2 e, se a API recusar,
