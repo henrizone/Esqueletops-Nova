@@ -1,5 +1,5 @@
 import { env } from "../../config/env.js";
-import { browserHeaders } from "./direct.js";
+import { logger } from "../../config/logger.js";
 import type { DownloadedMedia, MediaMetadata, RemoteMediaItem } from "./types.js";
 import { instagramCookieHeader, instagramCsrfToken } from "./cookies.js";
 
@@ -10,6 +10,7 @@ interface InstagramNode {
   dimensions?: { width?: number; height?: number };
   is_video?: boolean;
   video_url?: string;
+  video_duration?: number;
   display_url?: string;
   display_resources?: Array<{ src?: string; config_width?: number; config_height?: number }>;
   owner?: { username?: string };
@@ -34,6 +35,9 @@ const instagramHeaders: Record<string, string> = {
   "sec-ch-ua-platform": '"Windows"',
 };
 
+/** Token usado pelo SmudgeLord quando não há cookie de sessão configurado. */
+const ANONYMOUS_CSRF_TOKEN = "JKA19cNYckTn_Dr6bcTO5F";
+
 function requestHeaders(extra: Record<string, string> = {}) {
   const cookie = instagramCookieHeader();
   return {
@@ -44,29 +48,71 @@ function requestHeaders(extra: Record<string, string> = {}) {
   };
 }
 
-export function isInstagramPostUrl(rawUrl: string) {
+const POST_PATH = /\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i;
+const SHARE_PATH = /^\/share\/(?:(?:p|reel|reels|tv)\/)?[A-Za-z0-9_-]+/i;
+
+function instagramUrl(rawUrl: string): URL | undefined {
   try {
     const url = new URL(rawUrl);
     const host = url.hostname.toLowerCase().replace(/^www\./, "");
-    return (host === "instagram.com" || host.endsWith(".instagram.com"))
-      && /\/(?:p|reel|reels)\/[A-Za-z0-9_-]+/i.test(url.pathname);
+    return host === "instagram.com" || host.endsWith(".instagram.com") ? url : undefined;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+/** Links "compartilhar" (/share/...) não carregam o shortcode: precisam ser resolvidos. */
+export function isInstagramShareUrl(rawUrl: string) {
+  const url = instagramUrl(rawUrl);
+  return Boolean(url && SHARE_PATH.test(url.pathname));
+}
+
+export function isInstagramPostUrl(rawUrl: string) {
+  const url = instagramUrl(rawUrl);
+  return Boolean(url && (SHARE_PATH.test(url.pathname) || POST_PATH.test(url.pathname)));
 }
 
 export function isInstagramReelUrl(rawUrl: string) {
   try {
-    return /\/(?:reel|reels)\/[A-Za-z0-9_-]+/i.test(new URL(rawUrl).pathname);
+    return /\/(?:reel|reels|tv)\/[A-Za-z0-9_-]+/i.test(new URL(rawUrl).pathname);
   } catch {
     return false;
   }
 }
 
-function shortcode(rawUrl: string) {
-  const match = new URL(rawUrl).pathname.match(/\/(?:p|reel|reels)\/([A-Za-z0-9_-]+)/i);
+export function instagramShortcode(rawUrl: string) {
+  const url = new URL(rawUrl);
+  const match = SHARE_PATH.test(url.pathname) ? null : url.pathname.match(POST_PATH);
   if (!match?.[1]) throw new Error("Código da publicação do Instagram não encontrado");
   return match[1];
+}
+
+/**
+ * Segue o redirecionamento de um link /share/ até a URL canônica (/p/ ou
+ * /reel/). Quando o Instagram devolve a tela de login, o destino real vem no
+ * parâmetro `next`.
+ */
+export async function resolveInstagramShareUrl(rawUrl: string): Promise<string> {
+  if (!isInstagramShareUrl(rawUrl)) return rawUrl;
+  const response = await fetch(rawUrl, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS * 2),
+    headers: requestHeaders({ referer: "https://www.instagram.com/" }),
+  });
+  await response.body?.cancel().catch(() => undefined);
+  const candidates = [response.url];
+  try {
+    const next = new URL(response.url).searchParams.get("next");
+    if (next) candidates.push(new URL(next, "https://www.instagram.com").toString());
+  } catch {
+    // URL final inválida: tratada abaixo.
+  }
+  for (const candidate of candidates) {
+    const url = instagramUrl(candidate);
+    const match = url && !SHARE_PATH.test(url.pathname) ? url.pathname.match(POST_PATH) : null;
+    if (match?.[0]) return `https://www.instagram.com${match[0]}/`;
+  }
+  throw new Error("Não foi possível resolver o link de compartilhamento do Instagram");
 }
 
 function decodeHtml(value: string) {
@@ -144,17 +190,20 @@ function deepFindMediaNode(value: unknown, depth = 0): InstagramNode | undefined
   return undefined;
 }
 
+function nodeFromEnvelope(payload: unknown): InstagramNode | undefined {
+  const envelope = payload as InstagramEnvelope;
+  return envelope?.shortcode_media
+    ?? envelope?.data?.xdt_shortcode_media
+    ?? envelope?.xdt_shortcode_media
+    ?? deepFindMediaNode(payload);
+}
+
 function parseJsonCandidate(raw: string): InstagramNode | undefined {
   const variants = [raw, decodeInstagramEscapes(raw)];
   for (const candidate of variants) {
     for (const suffix of ["", "}"]) {
       try {
-        const parsed = JSON.parse(candidate + suffix) as InstagramEnvelope | InstagramNode;
-        const envelope = parsed as InstagramEnvelope;
-        const node = envelope.shortcode_media
-          ?? envelope.data?.xdt_shortcode_media
-          ?? envelope.xdt_shortcode_media
-          ?? deepFindMediaNode(parsed);
+        const node = nodeFromEnvelope(JSON.parse(candidate + suffix));
         if (node) return node;
       } catch {
         // Tenta a próxima variante.
@@ -279,18 +328,39 @@ function bestImage(node: InstagramNode) {
   return resources[0]?.src ?? node.display_url;
 }
 
-export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[] {
+function mediaNodes(node: InstagramNode): InstagramNode[] {
   const children = node.edge_sidecar_to_children?.edges
     ?.map((edge) => edge.node)
     .filter((child): child is InstagramNode => Boolean(child));
-  const nodes = children?.length ? children : [node];
+  return children?.length ? children : [node];
+}
+
+function nodeIsVideo(node: InstagramNode) {
+  return Boolean(node.is_video || node.video_url || /Video/i.test(node.__typename ?? ""));
+}
+
+function cleanCdnUrl(url?: string) {
+  return url?.replace(/\\u0026/gi, "&").replace(/&amp;/gi, "&");
+}
+
+/**
+ * Um nó só é aceito quando TODAS as mídias têm URL utilizável. O embed às
+ * vezes devolve vídeos sem `video_url`; antes esses itens eram descartados em
+ * silêncio e o carrossel chegava incompleto. Agora o nó incompleto é rejeitado
+ * para que a próxima fonte (GraphQL, yt-dlp...) entregue a publicação inteira.
+ */
+export function instagramNodeIsComplete(node: InstagramNode): boolean {
+  const nodes = mediaNodes(node);
+  return nodes.length > 0
+    && nodes.every((child) => Boolean(nodeIsVideo(child) ? child.video_url : bestImage(child)));
+}
+
+export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[] {
   const items: RemoteMediaItem[] = [];
   const seen = new Set<string>();
-  for (const child of nodes) {
-    const video = Boolean(child.is_video || child.video_url || /Video/i.test(child.__typename ?? ""));
-    const url = (video ? child.video_url : bestImage(child))
-      ?.replace(/\\u0026/gi, "&")
-      .replace(/&amp;/gi, "&");
+  for (const child of mediaNodes(node)) {
+    const video = nodeIsVideo(child);
+    const url = cleanCdnUrl(video ? child.video_url : bestImage(child));
     if (!url || seen.has(url)) continue;
     seen.add(url);
     items.push({
@@ -298,7 +368,8 @@ export function instagramNodeRemoteItems(node: InstagramNode): RemoteMediaItem[]
       url,
       width: child.dimensions?.width,
       height: child.dimensions?.height,
-      thumbnailUrl: video ? bestImage(child) : undefined,
+      duration: video && child.video_duration ? child.video_duration : undefined,
+      thumbnailUrl: video ? cleanCdnUrl(bestImage(child)) : undefined,
     });
   }
   return items.slice(0, env.MAX_MEDIA_ITEMS);
@@ -317,28 +388,19 @@ function fallbackFromMeta(html: string): { items: RemoteMediaItem[]; metadata: M
   return { items, metadata: { title, description, extractor: "instagram-embed" } };
 }
 
-async function fetchEmbed(code: string): Promise<{ html: string; node?: InstagramNode }> {
-  const embedUrl = `https://www.instagram.com/p/${code}/embed/captioned/`;
-  const response = await fetch(embedUrl, {
+async function fetchHtml(url: string, label: string): Promise<{ html: string; node?: InstagramNode }> {
+  const response = await fetch(url, {
     redirect: "follow",
     signal: AbortSignal.timeout(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS),
     headers: requestHeaders({ referer: "https://www.instagram.com/" }),
   });
-  if (!response.ok) throw new Error(`Embed do Instagram respondeu HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`${label} do Instagram respondeu HTTP ${response.status}`);
   const html = await response.text();
   return { html, node: extractInstagramGqlData(html) };
 }
 
-async function fetchPublicPage(code: string): Promise<{ html: string; node?: InstagramNode }> {
-  const response = await fetch(`https://www.instagram.com/p/${code}/`, {
-    redirect: "follow",
-    signal: AbortSignal.timeout(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS),
-    headers: requestHeaders({ referer: "https://www.instagram.com/" }),
-  });
-  if (!response.ok) throw new Error(`Página do Instagram respondeu HTTP ${response.status}`);
-  const html = await response.text();
-  return { html, node: extractInstagramGqlData(html) };
-}
+const fetchEmbed = (code: string) => fetchHtml(`https://www.instagram.com/p/${code}/embed/captioned/`, "Embed");
+const fetchPublicPage = (code: string) => fetchHtml(`https://www.instagram.com/p/${code}/`, "Página");
 
 async function fetchScraper(code: string): Promise<InstagramNode | undefined> {
   if (!env.INSTAGRAM_SCRAPER_URL) return undefined;
@@ -350,11 +412,7 @@ async function fetchScraper(code: string): Promise<InstagramNode | undefined> {
     headers: requestHeaders({ accept: "application/json" }),
   });
   if (!response.ok) throw new Error(`Scraper do Instagram respondeu HTTP ${response.status}`);
-  const payload = await response.json() as InstagramEnvelope;
-  return payload.shortcode_media
-    ?? payload.data?.xdt_shortcode_media
-    ?? payload.xdt_shortcode_media
-    ?? deepFindMediaNode(payload);
+  return nodeFromEnvelope(await response.json());
 }
 
 async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
@@ -372,7 +430,9 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
     signal: AbortSignal.timeout(Math.round(env.INSTAGRAM_ATTEMPT_TIMEOUT_MS * 1.5)),
     headers: requestHeaders({
       "content-type": "application/x-www-form-urlencoded",
-      "x-csrftoken": instagramCsrfToken() ?? "",
+      // Sem cookie de sessão o Instagram exige um CSRF qualquer não vazio;
+      // antes era enviado em branco e a consulta anônima era recusada.
+      "x-csrftoken": instagramCsrfToken() ?? ANONYMOUS_CSRF_TOKEN,
       "x-fb-lsd": "AVqBX1zadbA",
       "sec-fetch-site": "same-origin",
       origin: "https://www.instagram.com",
@@ -380,85 +440,131 @@ async function fetchGraphQl(code: string): Promise<InstagramNode | undefined> {
     }),
     body,
   });
-  if (!response.ok) return undefined;
-  const payload = await response.json() as InstagramEnvelope;
-  return payload.data?.xdt_shortcode_media
-    ?? payload.xdt_shortcode_media
-    ?? payload.shortcode_media
-    ?? deepFindMediaNode(payload);
+  if (!response.ok) throw new Error(`GraphQL do Instagram respondeu HTTP ${response.status}`);
+  return nodeFromEnvelope(await response.json());
+}
+
+type NodeAttempt = () => Promise<InstagramNode | undefined>;
+
+/**
+ * Requisições "hedged": a primeira fonte começa na hora; se ela demorar mais
+ * que `delayMs` (ou falhar), a próxima já é disparada em paralelo. Vence a
+ * primeira que devolver um nó completo. Isso elimina a espera em série de
+ * vários timeouts sem dobrar o número de requisições no caso comum.
+ */
+export async function firstCompleteNode(attempts: NodeAttempt[], delayMs: number): Promise<InstagramNode | undefined> {
+  if (!attempts.length) return undefined;
+  return new Promise((resolve) => {
+    let next = 0;
+    let pending = 0;
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (node?: InstagramNode) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      resolve(node);
+    };
+
+    const launch = () => {
+      if (done || next >= attempts.length) return;
+      const attempt = attempts[next]!;
+      next += 1;
+      pending += 1;
+      if (timer) clearTimeout(timer);
+      if (next < attempts.length) timer = setTimeout(launch, delayMs);
+      attempt()
+        .then((node) => (node && instagramNodeIsComplete(node) ? node : undefined), () => undefined)
+        .then((node) => {
+          pending -= 1;
+          if (node) finish(node);
+          else if (next < attempts.length) launch();
+          else if (pending === 0) finish();
+        });
+    };
+
+    launch();
+  });
 }
 
 export async function downloadInstagramMedia(rawUrl: string): Promise<DownloadedMedia> {
-  const code = shortcode(rawUrl);
+  const code = instagramShortcode(rawUrl);
   let html = "";
-  let node: InstagramNode | undefined;
 
-  // Mesma ordem conceitual do SmudgeLord: embed -> GraphQL. A página pública
-  // entra entre os dois para capturar payloads modernos do Instagram.
-  try {
-    const embed = await fetchEmbed(code);
-    html = embed.html;
-    node = embed.node;
-  } catch {
-    // Continua para os outros caminhos.
-  }
+  // Mesma ordem do SmudgeLord (embed -> GraphQL), mas sem esperar o timeout de
+  // uma fonte para começar a outra. A página pública fica por último.
+  const attempts: NodeAttempt[] = [
+    async () => {
+      const embed = await fetchEmbed(code);
+      html = embed.html;
+      return embed.node;
+    },
+    () => fetchGraphQl(code),
+  ];
+  if (env.INSTAGRAM_SCRAPER_URL) attempts.push(() => fetchScraper(code));
+  attempts.push(async () => {
+    const page = await fetchPublicPage(code);
+    if (!html) html = page.html;
+    return page.node;
+  });
 
-  if (!node && env.INSTAGRAM_SCRAPER_URL) {
-    node = await fetchScraper(code).catch(() => undefined);
-  }
+  const node = await firstCompleteNode(attempts, env.INSTAGRAM_HEDGE_DELAY_MS);
+
+  let remoteItems = node ? instagramNodeRemoteItems(node) : [];
+  let selectedNode = node;
+  let extractor = "instagram-smudge-direct";
+  let fallback: { items: RemoteMediaItem[]; metadata: MediaMetadata } = { items: [], metadata: {} };
+  let singleImageTitle: string | undefined;
 
   if (!node) {
-    try {
-      const page = await fetchPublicPage(code);
-      if (!html) html = page.html;
-      node = page.node;
-    } catch {
-      // Continua para GraphQL.
+    // Sem JSON estruturado só é seguro usar o HTML quando a publicação é de
+    // mídia única. Em carrossel, og:image traz apenas o primeiro slide: enviar
+    // isso seria entregar a publicação pela metade. Melhor falhar aqui e
+    // deixar o yt-dlp/gallery-dl buscarem o álbum completo.
+    if (/data-media-type=["'](?:GraphSidecar|XDTGraphSidecar)["']/i.test(html)) {
+      throw new Error("Embed do Instagram não trouxe os itens do carrossel");
     }
-  }
+    const expectsVideo = html ? instagramPageExpectsVideo(rawUrl, html) : isInstagramReelUrl(rawUrl);
+    if (html) fallback = fallbackFromMeta(html);
+    remoteItems = fallback.items;
+    extractor = "instagram-meta";
 
-  if (!node) node = await fetchGraphQl(code).catch(() => undefined);
+    // O embed de Reel costuma trazer somente og:image/thumbnail. Quando a URL
+    // ou o HTML indicam vídeo, uma resposta contendo apenas fotos é rejeitada
+    // para que o fluxo avance ao yt-dlp e obtenha o MP4 real.
+    if (expectsVideo && !remoteItems.some((item) => item.kind === "video")) {
+      throw new Error("Instagram retornou apenas a capa de uma publicação em vídeo");
+    }
 
-  const fallback = html
-    ? fallbackFromMeta(html)
-    : { items: [] as RemoteMediaItem[], metadata: {} as MediaMetadata };
-  const singleImage = html ? extractInstagramSingleImage(html) : undefined;
-  const expectsVideo = html ? instagramPageExpectsVideo(rawUrl, html) : isInstagramReelUrl(rawUrl);
-
-  let remoteItems = node ? instagramNodeRemoteItems(node) : fallback.items;
-  let selectedNode = node;
-  let extractor = node ? "instagram-smudge-direct" : "instagram-meta";
-
-  // O embed de Reel costuma trazer somente og:image/thumbnail. Antes, esse
-  // thumbnail era promovido a publicação e enviado com sendPhoto. Quando a
-  // URL ou o HTML indicam vídeo, uma resposta contendo apenas fotos é
-  // rejeitada para que o fluxo avance ao yt-dlp e obtenha o MP4 real.
-  if (expectsVideo && remoteItems.length && !remoteItems.some((item) => item.kind === "video")) {
-    throw new Error("Instagram retornou apenas a capa de uma publicação em vídeo");
-  }
-
-  // O parser visual do SmudgeLord continua disponível apenas como último
-  // fallback para uma foto verdadeira, nunca antes do GraphQL/metadados.
-  if (!remoteItems.length && singleImage && !expectsVideo) {
-    selectedNode = singleImage.node;
-    remoteItems = instagramNodeRemoteItems(singleImage.node);
-    extractor = "instagram-smudge-image-fallback";
+    // Parser visual do SmudgeLord: último recurso para uma foto verdadeira.
+    if (!remoteItems.length && html) {
+      const singleImage = extractInstagramSingleImage(html);
+      if (singleImage) {
+        selectedNode = singleImage.node;
+        singleImageTitle = singleImage.title;
+        remoteItems = instagramNodeRemoteItems(singleImage.node);
+        extractor = "instagram-smudge-image-fallback";
+      }
+    }
   }
 
   if (!remoteItems.length) throw new Error("Instagram não retornou fotos ou vídeos");
 
   const caption = selectedNode?.edge_media_to_caption?.edges?.[0]?.node?.text;
+  const username = selectedNode?.owner?.username;
+  logger.debug({ url: rawUrl, extractor, items: remoteItems.length }, "Instagram resolvido");
   return {
     files: [],
     remoteItems,
     metadata: {
       id: selectedNode?.id ?? code,
-      title: fallback.metadata.title ?? singleImage?.title,
+      title: fallback.metadata.title ?? singleImageTitle,
       description: caption ?? fallback.metadata.description,
-      uploader: selectedNode?.owner?.username ?? fallback.metadata.uploader,
-      uploaderId: selectedNode?.owner?.username ?? fallback.metadata.uploaderId,
-      profileUrl: selectedNode?.owner?.username
-        ? `https://www.instagram.com/${encodeURIComponent(selectedNode.owner.username)}/`
+      uploader: username ?? fallback.metadata.uploader,
+      uploaderId: username ?? fallback.metadata.uploaderId,
+      profileUrl: username
+        ? `https://www.instagram.com/${encodeURIComponent(username)}/`
         : fallback.metadata.profileUrl,
       webpageUrl: rawUrl,
       extractor,

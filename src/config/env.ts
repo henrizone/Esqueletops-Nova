@@ -44,7 +44,10 @@ const schema = z.object({
   MEDIA_ALLOWED_DOMAINS: z.string().default(""),
   ALLOW_GENERIC_URLS: bool.default(false),
   MAX_LINKS_PER_MESSAGE: z.coerce.number().int().min(1).max(10).default(3),
-  MAX_MEDIA_ITEMS: z.coerce.number().int().min(1).max(20).default(10),
+  // Instagram e X/Twitter aceitam até 20 mídias por publicação; o envio é
+  // fatiado em álbuns de 10 (limite do Telegram). Com quote no X, o tweet
+  // citado tem o próprio limite de MAX_MEDIA_ITEMS.
+  MAX_MEDIA_ITEMS: z.coerce.number().int().min(1).max(20).default(20),
   MAX_UPLOAD_MB: z.coerce.number().min(1).max(2000).default(49),
   MAX_AUTO_DURATION_SECONDS: z.coerce.number().int().min(1).default(180),
   MAX_FORCE_DURATION_SECONDS: z.coerce.number().int().min(1).default(1800),
@@ -67,7 +70,9 @@ const schema = z.object({
   ]).default("veryfast"),
   // Concorrência de preparação de mídia (ffmpeg/sharp). Aumente em máquinas com
   // mais núcleos para preparar álbuns em paralelo.
-  MEDIA_PREP_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(3),
+  MEDIA_PREP_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(4),
+  // Downloads simultâneos de mídias remotas (álbuns do Instagram etc.).
+  REMOTE_DOWNLOAD_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(6),
   // Caminho rápido: envia vídeos/fotos remotos já prontos (Twitter/X e a maioria
   // dos CDNs) direto ao Telegram, sem baixar em disco nem passar pelo FFmpeg.
   // É o que torna o envio quase instantâneo, como no SmudgeLord.
@@ -80,9 +85,20 @@ const schema = z.object({
   // rápido: devolve a URL direta do MP4 sem marca d'água, igual ao Twitter.
   TIKTOK_DIRECT_ENABLED: bool.default(true),
   TIKTOK_API_URL: z.string().default("https://www.tikwm.com/api/"),
+  // Pede ao tikwm a versão HD (qualidade original) e a usa como principal; a
+  // versão padrão fica como alternativa. Desligue para priorizar velocidade.
+  TIKTOK_HD: bool.default(true),
   // Timeout curto por tentativa nos fallbacks do Instagram, para falhar rápido
   // e ir para a próxima estratégia em vez de travar.
   INSTAGRAM_ATTEMPT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(4000),
+  // Se a fonte atual do Instagram não respondeu nesse tempo, a próxima é
+  // disparada em paralelo (sem cancelar a anterior).
+  INSTAGRAM_HEDGE_DELAY_MS: z.coerce.number().int().min(0).max(10000).default(900),
+  // Timeout por consulta ao X/Twitter (FxTwitter e GraphQL rodam em paralelo).
+  TWITTER_ATTEMPT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(8000),
+  // Depois que a primeira fonte do X responde, quanto esperar pela segunda
+  // para complementar variantes de vídeo/texto antes de enviar.
+  TWITTER_MERGE_GRACE_MS: z.coerce.number().int().min(0).max(10000).default(1200),
   MEDIA_CACHE_TTL_SECONDS: z.coerce.number().int().min(60).default(604800),
   MEDIA_PROGRESS_MESSAGES: bool.default(false),
   MEDIA_INCLUDE_SOURCE_LINK: bool.default(true),

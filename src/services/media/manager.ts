@@ -8,7 +8,7 @@ import { escapeHtml, truncate } from "../../utils/html.js";
 import { buildMediaCaption } from "./caption.js";
 import { prepareMediaFiles } from "./convert.js";
 import { materializeRemoteItems } from "./direct.js";
-import { sendCachedMedia, sendPreparedMedia, sendRemoteMedia, sendTextPost } from "./sender.js";
+import { PartialSendError, sendCachedMedia, sendPreparedMedia, sendRemoteMedia, sendTextPost } from "./sender.js";
 import type { CachedMediaItem, CachedMediaPayload, DownloadRequest, PreparedMediaItem, RemoteMediaItem } from "./types.js";
 import { mediaCacheKey } from "./urls.js";
 import { downloadMedia } from "./ytdlp.js";
@@ -22,6 +22,11 @@ async function logFailure(ctx: BotContext, code: string, request: DownloadReques
     `<b>DOWNLOAD ${code}</b>\nURL: <code>${escapeHtml(truncate(request.url, 1500))}</code>\nErro: <code>${escapeHtml(truncate(errorMessage(error), 2000))}</code>`,
     { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   ).catch(() => undefined);
+}
+
+async function deleteSourceMessage(ctx: BotContext, request: DownloadRequest) {
+  if (!request.deleteSource || !request.sourceMessageId) return;
+  await ctx.api.deleteMessage(request.chatId, request.sourceMessageId).catch(() => undefined);
 }
 
 function activityFor(items: PreparedMediaItem[]) {
@@ -81,6 +86,8 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     const caption = request.captionEnabled ? buildMediaCaption(cached.metadata, request.url) : "";
     try {
       await sendCachedMedia(ctx, cached, caption, request.replyToMessageId, request.url);
+      // Antes o link original só era apagado quando a mídia NÃO vinha do cache.
+      await deleteSourceMessage(ctx, request);
       logger.info({ url: request.url, durationMs: Date.now() - startedAt, cache: true }, "Mídia enviada");
       return true;
     } catch (error) {
@@ -105,78 +112,87 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     }
 
     const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
+    const store = async (items: CachedMediaItem[]) => {
+      if (!items.length) return;
+      await cacheSetJson(`media:${key}`, {
+        items,
+        metadata,
+        cachedAt: new Date().toISOString(),
+      } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
+    };
+
+    // Itens ainda não entregues e o que já foi enviado. O caminho rápido pode
+    // falhar depois do primeiro álbum de uma publicação com mais de 10 mídias;
+    // nesse caso o fallback continua só com o restante, sem duplicar nada.
+    let remaining: RemoteMediaItem[] = downloaded.remoteItems ?? [];
+    const delivered: CachedMediaItem[] = [];
+    let sentSomething = false;
 
     // CAMINHO RÁPIDO (estilo SmudgeLord): quando o extrator já entrega URLs de
     // MP4/foto prontos (Twitter/X, TikTok via tikwm), enviamos direto ao
     // Telegram sem baixar em disco e sem passar pelo FFmpeg.
     //
     // EXCEÇÃO: Instagram. O Telegram NÃO consegue baixar as URLs do CDN do
-    // Instagram (cdninstagram.com/fbcdn.net) -- retorna erro 400 e trava em
-    // retries. Portanto o Instagram nunca usa o atalho: baixa os bytes pelo bot,
-    // exatamente como o SmudgeLord faz.
+    // Instagram (cdninstagram.com/fbcdn.net), então ele sempre baixa os bytes
+    // pelo bot, exatamente como o SmudgeLord faz.
     const isInstagram = isInstagramPostUrl(request.url);
     if (
       env.REMOTE_FAST_PATH
       && !isInstagram
-      && downloaded.remoteItems?.length
+      && remaining.length
       && !downloaded.files.length
-      && remoteItemsAreTelegramReady(downloaded.remoteItems)
+      && remoteItemsAreTelegramReady(remaining)
     ) {
-      {
-        try {
-          const activity = downloaded.remoteItems.some((item) => item.kind === "video")
-            ? "upload_video" as const
-            : "upload_photo" as const;
-          await ctx.api.sendChatAction(request.chatId, activity).catch(() => undefined);
-          const fastItems: CachedMediaItem[] = await sendRemoteMedia(
-            ctx,
-            downloaded.remoteItems,
-            caption,
-            request.replyToMessageId,
-            request.url,
-          );
-          if (fastItems.length) {
-            await cacheSetJson(`media:${key}`, {
-              items: fastItems,
-              metadata,
-              cachedAt: new Date().toISOString(),
-            } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
-          }
-          if (request.deleteSource && request.sourceMessageId && ctx.chat) {
-            await ctx.api.deleteMessage(ctx.chat.id, request.sourceMessageId).catch(() => undefined);
-          }
-          logger.info({
-            url: request.url,
-            durationMs: Date.now() - startedAt,
-            mediaCount: downloaded.remoteItems.length,
-            extractor: metadata.extractor,
-            fastPath: true,
-          }, "Mídia enviada");
-          return true;
-        } catch (error) {
-          // Se o envio direto falhar (CDN recusa referer, etc.), caímos no
-          // fluxo tradicional de baixar + preparar logo abaixo.
-          logger.warn({ error, url: request.url }, "Caminho rápido remoto falhou; usando download tradicional");
+      const total = remaining.length;
+      try {
+        const activity = remaining.some((item) => item.kind === "video")
+          ? "upload_video" as const
+          : "upload_photo" as const;
+        await ctx.api.sendChatAction(request.chatId, activity).catch(() => undefined);
+        const fastItems = await sendRemoteMedia(ctx, remaining, caption, request.replyToMessageId, request.url);
+        await store(fastItems);
+        await deleteSourceMessage(ctx, request);
+        logger.info({
+          url: request.url,
+          durationMs: Date.now() - startedAt,
+          mediaCount: total,
+          extractor: metadata.extractor,
+          fastPath: true,
+        }, "Mídia enviada");
+        return true;
+      } catch (error) {
+        if (error instanceof PartialSendError) {
+          delivered.push(...error.sent);
+          remaining = remaining.slice(error.sentCount);
+          sentSomething = error.sentCount > 0;
         }
+        // Se o envio direto falhar (CDN recusa, mídia fora do padrão etc.),
+        // o restante segue pelo fluxo de baixar + preparar logo abaixo.
+        logger.warn({ error, url: request.url, alreadySent: total - remaining.length }, "Caminho rápido remoto falhou; usando download tradicional");
       }
     }
 
     let prepared: PreparedMediaItem[] = [];
+    // Só guardamos no cache publicações entregues por inteiro. Um álbum
+    // incompleto em cache seria reenviado incompleto por dias.
+    let complete = true;
 
-    if (downloaded.remoteItems?.length) {
+    if (remaining.length) {
       // O SmudgeLord baixa as mídias antes de enviá-las. Isso preserva o tipo
       // real e evita travamentos do Telegram ao buscar CDNs com referer.
-      const local = await materializeRemoteItems(downloaded.remoteItems, request.url);
+      const local = await materializeRemoteItems(remaining, request.url);
       directories.add(local.directory);
       prepared = await prepareMediaFiles(local.files);
+      complete = local.failed === 0 && prepared.length === local.files.length;
     } else if (downloaded.files.length) {
       prepared = await prepareMediaFiles(downloaded.files);
+      complete = prepared.length === downloaded.files.length;
     }
 
     // Última barreira antes do Telegram: Reel ou post identificado como vídeo
     // jamais pode ser enviado como foto, mesmo que algum fallback tenha
     // retornado apenas a thumbnail.
-    const instagramExpectsVideo = isInstagramPostUrl(request.url) && (
+    const instagramExpectsVideo = isInstagram && (
       isInstagramReelUrl(request.url)
       || Boolean(metadata.duration && metadata.duration > 0)
     );
@@ -184,10 +200,17 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
       throw new Error("Instagram identificou publicação em vídeo, mas nenhum MP4 foi obtido; thumbnail não será enviada como foto");
     }
 
-    let items: CachedMediaPayload["items"] = [];
     if (prepared.length) {
       await ctx.api.sendChatAction(request.chatId, activityFor(prepared)).catch(() => undefined);
-      items = await sendPreparedMedia(ctx, prepared, caption, request.replyToMessageId, request.url);
+      delivered.push(...await sendPreparedMedia(
+        ctx,
+        prepared,
+        sentSomething ? "" : caption,
+        request.replyToMessageId,
+        sentSomething ? undefined : request.url,
+      ));
+    } else if (sentSomething) {
+      complete = false;
     } else if (metadata.captionHtml) {
       await sendTextPost(ctx, caption, request.replyToMessageId, request.url);
     } else {
@@ -195,17 +218,10 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
       return false;
     }
 
-    if (items.length) {
-      await cacheSetJson(`media:${key}`, {
-        items,
-        metadata,
-        cachedAt: new Date().toISOString(),
-      } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
-    }
+    if (complete) await store(delivered);
+    else logger.warn({ url: request.url, sent: delivered.length }, "Publicação enviada incompleta; resultado não será guardado em cache");
 
-    if (request.deleteSource && request.sourceMessageId && ctx.chat) {
-      await ctx.api.deleteMessage(ctx.chat.id, request.sourceMessageId).catch(() => undefined);
-    }
+    await deleteSourceMessage(ctx, request);
 
     logger.info({
       url: request.url,

@@ -30,8 +30,37 @@ function appendAuthor(lines: string[], metadata: MediaMetadata, url: string) {
   return author;
 }
 
+/** Texto visível de um trecho HTML: é o que o Telegram conta no limite de 1024. */
+function visibleText(html: string) {
+  return html
+    .replace(/<[^>]*>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Margem para o link "🔗 Abrir no ..." que os álbuns acrescentam à legenda.
+ * O limite do Telegram (1024) vale para o texto visível, não para as tags.
+ */
+const CAPTION_VISIBLE_LIMIT = 980;
+
+/**
+ * Cortar HTML no meio (como era feito) podia partir uma tag ou entidade e o
+ * Telegram recusava a mensagem inteira. Se a legenda couber, vai intacta; se
+ * não couber, vira texto simples truncado — nunca HTML quebrado.
+ */
+export function fitCaption(html: string) {
+  const trimmed = html.trim();
+  const visible = visibleText(trimmed);
+  if (visible.length <= CAPTION_VISIBLE_LIMIT) return trimmed;
+  return escapeHtml(truncate(visible, CAPTION_VISIBLE_LIMIT));
+}
+
 export function buildMediaCaption(metadata: MediaMetadata, url: string) {
-  if (metadata.captionHtml?.trim()) return truncate(metadata.captionHtml.trim(), 1000);
+  if (metadata.captionHtml?.trim()) return fitCaption(metadata.captionHtml);
 
   const lines: string[] = [];
   const pageUrl = metadata.webpageUrl ?? url;
@@ -70,5 +99,5 @@ export function buildMediaCaption(metadata: MediaMetadata, url: string) {
   if (env.MEDIA_INCLUDE_SOURCE_LINK && !env.MEDIA_SOURCE_BUTTON) {
     lines.push(`<a href="${escapeHtml(pageUrl)}">🔗 Abrir publicação original</a>`);
   }
-  return truncate(lines.filter(Boolean).join("\n"), 1000);
+  return fitCaption(lines.filter(Boolean).join("\n"));
 }

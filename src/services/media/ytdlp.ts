@@ -6,7 +6,13 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { DownloadedMedia, DownloadMode, MediaMetadata, RemoteMediaItem } from "./types.js";
 import { downloadWithGalleryDl } from "./gallerydl.js";
-import { downloadInstagramMedia, isInstagramPostUrl, isInstagramReelUrl } from "./instagram.js";
+import {
+  downloadInstagramMedia,
+  isInstagramPostUrl,
+  isInstagramReelUrl,
+  isInstagramShareUrl,
+  resolveInstagramShareUrl,
+} from "./instagram.js";
 import { downloadTwitterMedia, isTwitterStatusUrl } from "./twitter.js";
 import { downloadTikTokMedia, isTikTokUrl } from "./tiktok.js";
 import { cookieFileForUrl } from "./cookies.js";
@@ -471,7 +477,18 @@ async function downloadWithYtDlp(url: string, mode: DownloadMode): Promise<Downl
   }
 }
 
-export async function downloadMedia(url: string, mode: DownloadMode): Promise<DownloadedMedia> {
+export async function downloadMedia(rawUrl: string, mode: DownloadMode): Promise<DownloadedMedia> {
+  let url = rawUrl;
+  if (isInstagramShareUrl(url)) {
+    // Links /share/ não trazem o shortcode. Resolve uma vez para que todos os
+    // extratores (inclusive yt-dlp) trabalhem com a URL canônica.
+    try {
+      url = await resolveInstagramShareUrl(url);
+    } catch (error) {
+      logger.info({ url, error }, "Não foi possível resolver o link de compartilhamento do Instagram");
+    }
+  }
+
   if (mode !== "audio" && isTwitterStatusUrl(url)) {
     // O extrator dedicado seleciona somente as mídias do tweet principal e
     // mantém o tweet citado apenas como texto. O yt-dlp não garante isso.
@@ -490,7 +507,7 @@ export async function downloadMedia(url: string, mode: DownloadMode): Promise<Do
 
   const instagram = mode !== "audio" && isInstagramPostUrl(url);
   const extractorErrors: unknown[] = [];
-  if (instagram) {
+  if (instagram && !isInstagramShareUrl(url)) {
     // Mesma prioridade do SmudgeLord: embed/scraper/GraphQL primeiro. O JSON
     // do yt-dlp é apenas fallback para imagens e carrosséis.
     if (env.INSTAGRAM_EMBED_ENABLED) {

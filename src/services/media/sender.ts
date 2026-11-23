@@ -12,13 +12,43 @@ import type {
 import { sourceCaptionLink, sourceKeyboard } from "./source-button.js";
 import { browserHeaders } from "./direct.js";
 
+/** Limite de itens por álbum (sendMediaGroup) no Telegram. */
+const ALBUM_SIZE = 10;
+/**
+ * Quando o Telegram baixa a mídia a partir de uma URL, o limite é 20 MB para
+ * vídeos e 5 MB para fotos. Acima disso o bot precisa transmitir os bytes.
+ */
+const TELEGRAM_URL_VIDEO_LIMIT = 19 * 1024 * 1024;
+
+type CaptionOptions = { caption: string; parse_mode: "HTML" };
+
+/**
+ * Erro de envio remoto que preserva o que já foi entregue. Sem isso, uma falha
+ * no segundo álbum de uma publicação com mais de 10 mídias fazia o fallback
+ * reenviar tudo desde o início, duplicando o primeiro álbum no chat.
+ */
+export class PartialSendError extends Error {
+  constructor(
+    cause: unknown,
+    readonly sent: CachedMediaItem[],
+    /** Quantos itens da lista original já foram enviados com sucesso. */
+    readonly sentCount: number,
+  ) {
+    super("Envio remoto interrompido", { cause });
+    this.name = "PartialSendError";
+  }
+}
+
 function replyParams(replyToMessageId?: number) {
-  return replyToMessageId ? { reply_parameters: { message_id: replyToMessageId } } : {};
+  return replyToMessageId
+    ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
+    : {};
 }
 
 function fileIdFromMessage(message: Message, kind: CachedMediaItem["kind"]): string | undefined {
   if (kind === "photo" && message.photo?.length) return message.photo.at(-1)?.file_id;
-  if (kind === "video") return message.video?.file_id;
+  // GIFs do X chegam como vídeo sem áudio; o Telegram pode devolvê-los como animação.
+  if (kind === "video") return message.video?.file_id ?? message.animation?.file_id;
   if (kind === "audio") return message.audio?.file_id;
   if (kind === "document") return message.document?.file_id;
   return undefined;
@@ -39,6 +69,15 @@ function albumCaption(caption: string, sourceUrl?: string) {
   const link = sourceCaptionLink(sourceUrl);
   if (!link) return caption;
   return [caption, link].filter(Boolean).join("\n\n");
+}
+
+function singleOptions(caption: string, replyToMessageId?: number, sourceUrl?: string) {
+  return {
+    caption: caption || undefined,
+    parse_mode: "HTML" as const,
+    reply_markup: env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined,
+    ...replyParams(replyToMessageId),
+  };
 }
 
 function remoteInput(url: string, sourceUrl?: string) {
@@ -72,49 +111,27 @@ function remoteUrls(item: RemoteMediaItem) {
 }
 
 /**
- * Detecta o erro do Telegram quando ele NÃO consegue baixar a mídia a partir da
- * URL ("Wrong file identifier/HTTP URL specified"). Nesse caso não adianta
- * repetir com a mesma URL: o certo é cair no download em bytes imediatamente.
- */
-function telegramRejectedRemoteUrl(error: unknown): boolean {
-  const description = String(
-    (error as { description?: string })?.description
-    ?? (error as { message?: string })?.message
-    ?? error,
-  ).toLowerCase();
-  return description.includes("wrong file identifier")
-    || description.includes("wrong type of the web page content")
-    || description.includes("failed to get http url content")
-    || description.includes("wrong remote file");
-}
-
-/**
  * Alguns CDNs são públicos e o próprio Telegram consegue baixar a mídia a
  * partir da URL, sem precisar que o bot faça streaming pelo Node. Isso torna o
  * envio praticamente instantâneo (o arquivo nunca passa pela nossa máquina).
  *
- * Habilitamos para hosts que NÃO exigem cabeçalho referer nem cookies: os CDNs
- * de vídeo/foto do Twitter/X, Instagram (Facebook CDN), TikTok (ByteDance) e
- * Reddit. Se um link específico falhar (expirou, exige referer, etc.), o chamador
- * já cai automaticamente no streaming pelo bot (`remoteInput`), então o pior caso
- * é voltar ao comportamento antigo — nunca uma falha para o usuário.
+ * Só entram hosts que NÃO exigem referer nem cookies. Se um link falhar, o
+ * mesmo arquivo é transmitido pelo bot (`remoteInput`) na tentativa seguinte,
+ * então o pior caso é o comportamento antigo, sem perda de qualidade.
  *
- * A lista pode ser estendida/reduzida via env `TELEGRAM_DIRECT_CDN_HOSTS`
- * (separada por vírgulas) sem recompilar.
+ * A lista pode ser estendida via env `TELEGRAM_DIRECT_CDN_HOSTS`.
  */
 const DEFAULT_DIRECT_CDN_HOSTS = [
   // Twitter / X -- comprovadamente aceitos pelo Telegram sem referer.
   "twimg.com",
-  "twitter.com",
   // Reddit
   "redd.it",
   "redditmedia.com",
   // Proxy do extrator de TikTok (tikwm) -- URLs públicas, sem referer.
   "tikwm.com",
   // ATENÇÃO: NÃO adicionar cdninstagram.com / fbcdn.net aqui. O Telegram
-  // RECUSA essas URLs (erro 400 "Wrong file identifier/HTTP URL specified"),
-  // porque elas exigem headers/assinatura que ele não envia. O Instagram é
-  // sempre baixado em bytes pelo bot (como o SmudgeLord faz), nunca por URL.
+  // RECUSA essas URLs (erro 400 "Wrong file identifier/HTTP URL specified").
+  // O Instagram é sempre baixado em bytes pelo bot, como o SmudgeLord faz.
 ];
 
 function directCdnHosts(): string[] {
@@ -126,23 +143,55 @@ function directCdnHosts(): string[] {
 }
 
 function hostMatchesDirectCdn(host: string): boolean {
-  for (const cdn of directCdnHosts()) {
-    // Casa o host exato ou qualquer subdomínio: "cdninstagram.com" cobre
-    // "scontent-xyz.cdninstagram.com". `includes` cobre variações como
-    // "v16-webapp.tiktokcdn-us.com".
-    if (host === cdn || host.endsWith(`.${cdn}`) || host.includes(cdn)) return true;
-  }
-  return false;
+  // Somente o host exato ou um subdomínio. Antes havia um `includes`, que
+  // casava hosts de terceiros como "twimg.com.exemplo.net".
+  return directCdnHosts().some((cdn) => host === cdn || host.endsWith(`.${cdn}`));
 }
 
-function telegramCanFetchDirectly(url: string): boolean {
+function telegramCanFetchDirectly(item: RemoteMediaItem, url: string): boolean {
   if (!env.REMOTE_FAST_PATH) return false;
+  // Vídeo grande demais para o Telegram buscar sozinho: vai por streaming, na
+  // mesma qualidade, em vez de cair para uma variante menor.
+  if (item.kind === "video" && url === item.url && (item.sizeBytes ?? 0) > TELEGRAM_URL_VIDEO_LIMIT) return false;
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    return hostMatchesDirectCdn(host);
+    return hostMatchesDirectCdn(new URL(url).hostname.toLowerCase());
   } catch {
     return false;
   }
+}
+
+interface SendPlan {
+  url: string;
+  /** true = o Telegram baixa da URL; false = o bot transmite os bytes. */
+  direct: boolean;
+}
+
+/**
+ * Ordem das tentativas para um item: melhor URL direto -> a MESMA URL por
+ * streaming -> variantes menores. A qualidade só cai quando a melhor variante
+ * realmente não pôde ser enviada de nenhuma forma.
+ */
+export function remoteSendPlans(item: RemoteMediaItem): SendPlan[] {
+  const plans: SendPlan[] = [];
+  for (const url of remoteUrls(item)) {
+    if (telegramCanFetchDirectly(item, url)) plans.push({ url, direct: true });
+    plans.push({ url, direct: false });
+  }
+  return plans;
+}
+
+function planInput(plan: SendPlan, sourceUrl?: string) {
+  return plan.direct ? plan.url : remoteInput(plan.url, sourceUrl);
+}
+
+function remoteVideoOptions(item: RemoteMediaItem, plan: SendPlan, sourceUrl?: string) {
+  return {
+    supports_streaming: true,
+    width: item.width,
+    height: item.height,
+    duration: item.duration ? Math.round(item.duration) : undefined,
+    thumbnail: item.thumbnailUrl && !plan.direct ? remoteInput(item.thumbnailUrl, sourceUrl) : undefined,
+  };
 }
 
 async function sendOneLocalOrCached(
@@ -153,12 +202,7 @@ async function sendOneLocalOrCached(
   sourceUrl?: string,
 ): Promise<Message> {
   const media = "path" in item ? new InputFile(item.path, item.filename) : item.fileId;
-  const common = {
-    caption: caption || undefined,
-    parse_mode: "HTML" as const,
-    reply_markup: env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined,
-    ...replyParams(replyToMessageId),
-  };
+  const common = singleOptions(caption, replyToMessageId, sourceUrl);
   switch (item.kind) {
     case "photo": return ctx.replyWithPhoto(media, common);
     case "video": {
@@ -184,38 +228,21 @@ async function sendOneRemote(
   sourceUrl?: string,
 ): Promise<Message> {
   let lastError: unknown;
-  for (const url of remoteUrls(item)) {
+  for (const plan of remoteSendPlans(item)) {
     try {
-      // Se o Telegram consegue baixar a URL sozinho, passamos a string direta:
-      // o vídeo vai do CDN para o Telegram sem tocar na nossa máquina (instantâneo).
-      // Caso contrário, transmitimos pelo Node com headers de navegador.
-      const media = telegramCanFetchDirectly(url) ? url : remoteInput(url, sourceUrl);
-      const common = {
-        caption: caption || undefined,
-        parse_mode: "HTML" as const,
-        reply_markup: env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined,
-        ...replyParams(replyToMessageId),
-      };
+      const media = planInput(plan, sourceUrl);
+      const common = singleOptions(caption, replyToMessageId, sourceUrl);
       if (item.kind === "photo") return await ctx.replyWithPhoto(media, common);
-      return await ctx.replyWithVideo(media, {
-        ...common,
-        supports_streaming: true,
-        width: item.width,
-        height: item.height,
-        duration: item.duration ? Math.round(item.duration) : undefined,
-        thumbnail: item.thumbnailUrl && !telegramCanFetchDirectly(url)
-          ? remoteInput(item.thumbnailUrl, sourceUrl)
-          : undefined,
-      });
+      return await ctx.replyWithVideo(media, { ...common, ...remoteVideoOptions(item, plan, sourceUrl) });
     } catch (error) {
       lastError = error;
-      logger.warn({ error, url }, "Falha em uma variante remota; tentando a próxima");
+      logger.warn({ error, url: plan.url, direct: plan.direct }, "Falha em uma variante remota; tentando a próxima");
     }
   }
   throw lastError ?? new Error("Nenhuma variante remota pôde ser enviada");
 }
 
-function preparedAlbumItem(item: PreparedMediaItem, options?: { caption: string; parse_mode: "HTML" }) {
+function preparedAlbumItem(item: PreparedMediaItem, options?: CaptionOptions) {
   const media = new InputFile(item.path, item.filename);
   return item.kind === "photo"
     ? InputMediaBuilder.photo(media, options)
@@ -228,26 +255,21 @@ function preparedAlbumItem(item: PreparedMediaItem, options?: { caption: string;
     });
 }
 
-function cachedAlbumItem(item: CachedMediaItem, options?: { caption: string; parse_mode: "HTML" }) {
+function cachedAlbumItem(item: CachedMediaItem, options?: CaptionOptions) {
   return item.kind === "photo"
     ? InputMediaBuilder.photo(item.fileId, options)
     : InputMediaBuilder.video(item.fileId, { ...options, supports_streaming: true });
 }
 
-function remoteAlbumItem(item: RemoteMediaItem, url: string, sourceUrl?: string, options?: { caption: string; parse_mode: "HTML" }) {
-  const media = telegramCanFetchDirectly(url) ? url : remoteInput(url, sourceUrl);
+function remoteAlbumItem(item: RemoteMediaItem, plan: SendPlan, sourceUrl?: string, options?: CaptionOptions) {
+  const media = planInput(plan, sourceUrl);
   return item.kind === "photo"
     ? InputMediaBuilder.photo(media, options)
-    : InputMediaBuilder.video(media, {
-      ...options,
-      supports_streaming: true,
-      width: item.width,
-      height: item.height,
-      duration: item.duration ? Math.round(item.duration) : undefined,
-      thumbnail: item.thumbnailUrl && !telegramCanFetchDirectly(url)
-        ? remoteInput(item.thumbnailUrl, sourceUrl)
-        : undefined,
-    });
+    : InputMediaBuilder.video(media, { ...options, ...remoteVideoOptions(item, plan, sourceUrl) });
+}
+
+function firstItemCaption(index: number, caption: string): CaptionOptions | undefined {
+  return index === 0 && caption ? { caption, parse_mode: "HTML" } : undefined;
 }
 
 async function sendPreparedAlbumChunk(
@@ -263,10 +285,7 @@ async function sendPreparedAlbumChunk(
     return fileId ? [{ kind: items[0]!.kind, fileId, filename: items[0]!.filename }] : [];
   }
   const finalCaption = albumCaption(caption, sourceUrl);
-  const group = items.map((item, index) => preparedAlbumItem(
-    item,
-    index === 0 && finalCaption ? { caption: finalCaption, parse_mode: "HTML" } : undefined,
-  ));
+  const group = items.map((item, index) => preparedAlbumItem(item, firstItemCaption(index, finalCaption)));
   const messages = await ctx.replyWithMediaGroup(group, replyParams(replyToMessageId));
   return messages.flatMap((message, index) => {
     const item = items[index];
@@ -288,10 +307,7 @@ async function sendCachedAlbumChunk(
     return;
   }
   const finalCaption = albumCaption(caption, sourceUrl);
-  const group = items.map((item, index) => cachedAlbumItem(
-    item,
-    index === 0 && finalCaption ? { caption: finalCaption, parse_mode: "HTML" } : undefined,
-  ));
+  const group = items.map((item, index) => cachedAlbumItem(item, firstItemCaption(index, finalCaption)));
   await ctx.replyWithMediaGroup(group, replyParams(replyToMessageId));
 }
 
@@ -308,17 +324,16 @@ async function sendRemoteAlbumChunk(
     return fileId ? [{ kind: items[0]!.kind, fileId }] : [];
   }
 
-  const maxAttempts = Math.min(4, Math.max(...items.map((item) => remoteUrls(item).length)));
+  const plans = items.map(remoteSendPlans);
+  const maxAttempts = Math.min(4, Math.max(...plans.map((list) => list.length)));
+  const finalCaption = albumCaption(caption, sourceUrl);
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      const finalCaption = albumCaption(caption, sourceUrl);
       const group = items.map((item, index) => {
-        const urls = remoteUrls(item);
-        const url = urls[Math.min(attempt, urls.length - 1)]!;
-        return remoteAlbumItem(item, url, sourceUrl, index === 0 && finalCaption
-          ? { caption: finalCaption, parse_mode: "HTML" }
-          : undefined);
+        const list = plans[index]!;
+        const plan = list[Math.min(attempt, list.length - 1)]!;
+        return remoteAlbumItem(item, plan, sourceUrl, firstItemCaption(index, finalCaption));
       });
       const messages = await ctx.replyWithMediaGroup(group, replyParams(replyToMessageId));
       return messages.flatMap((message, index) => {
@@ -329,14 +344,7 @@ async function sendRemoteAlbumChunk(
       });
     } catch (error) {
       lastError = error;
-      // Se o Telegram RECUSA a URL (não consegue baixar do CDN), tentar de novo
-      // com a mesma URL é inútil -- vai falhar igual. Aborta já para cair no
-      // download em bytes, sem gastar 4 tentativas (que somam dezenas de segundos).
-      if (telegramRejectedRemoteUrl(error)) {
-        logger.warn({ error, url: sourceUrl }, "Telegram recusou a URL remota; indo direto ao download em bytes");
-        throw error;
-      }
-      logger.warn({ error, attempt: attempt + 1 }, "Falha ao enviar álbum remoto; tentando variantes menores");
+      logger.warn({ error, attempt: attempt + 1, url: sourceUrl }, "Falha ao enviar álbum remoto; tentando a próxima forma de envio");
     }
   }
   throw lastError ?? new Error("Não foi possível enviar o álbum remoto");
@@ -356,6 +364,11 @@ export async function sendTextPost(
   });
 }
 
+/**
+ * Envia mídias remotas em álbuns de até 10 itens (uma publicação com 20
+ * mídias vira dois álbuns). A legenda vai apenas no primeiro álbum; todos
+ * respondem à mensagem original.
+ */
 export async function sendRemoteMedia(
   ctx: BotContext,
   items: RemoteMediaItem[],
@@ -364,11 +377,21 @@ export async function sendRemoteMedia(
   sourceUrl?: string,
 ): Promise<CachedMediaItem[]> {
   const cached: CachedMediaItem[] = [];
-  for (const groupItems of chunks(items.filter(isAlbumMedia), 10)) {
-    cached.push(...await sendRemoteAlbumChunk(ctx, groupItems, caption, replyToMessageId, sourceUrl));
-    caption = "";
-    replyToMessageId = undefined;
-    sourceUrl = undefined;
+  let sentCount = 0;
+  for (const groupItems of chunks(items.filter(isAlbumMedia), ALBUM_SIZE)) {
+    const first = sentCount === 0;
+    try {
+      cached.push(...await sendRemoteAlbumChunk(
+        ctx,
+        groupItems,
+        first ? caption : "",
+        replyToMessageId,
+        first ? sourceUrl : undefined,
+      ));
+    } catch (error) {
+      throw new PartialSendError(error, cached, sentCount);
+    }
+    sentCount += groupItems.length;
   }
   return cached;
 }
@@ -385,12 +408,12 @@ export async function sendPreparedMedia(
   const otherItems = items.filter((item) => !isAlbumMedia(item));
   let firstMessage = true;
 
-  for (const groupItems of chunks(albumItems, 10)) {
+  for (const groupItems of chunks(albumItems, ALBUM_SIZE)) {
     cached.push(...await sendPreparedAlbumChunk(
       ctx,
       groupItems,
       firstMessage ? caption : "",
-      firstMessage ? replyToMessageId : undefined,
+      replyToMessageId,
       firstMessage ? sourceUrl : undefined,
     ));
     firstMessage = false;
@@ -401,7 +424,7 @@ export async function sendPreparedMedia(
       ctx,
       item,
       firstMessage ? caption : "",
-      firstMessage ? replyToMessageId : undefined,
+      replyToMessageId,
       firstMessage ? sourceUrl : undefined,
     );
     const fileId = fileIdFromMessage(message, item.kind);
@@ -423,12 +446,12 @@ export async function sendCachedMedia(
   const otherItems = payload.items.filter((item) => !isAlbumMedia(item));
   let firstMessage = true;
 
-  for (const groupItems of chunks(albumItems, 10)) {
+  for (const groupItems of chunks(albumItems, ALBUM_SIZE)) {
     await sendCachedAlbumChunk(
       ctx,
       groupItems,
       firstMessage ? caption : "",
-      firstMessage ? replyToMessageId : undefined,
+      replyToMessageId,
       firstMessage ? sourceUrl : undefined,
     );
     firstMessage = false;
@@ -439,7 +462,7 @@ export async function sendCachedMedia(
       ctx,
       item,
       firstMessage ? caption : "",
-      firstMessage ? replyToMessageId : undefined,
+      replyToMessageId,
       firstMessage ? sourceUrl : undefined,
     );
     firstMessage = false;

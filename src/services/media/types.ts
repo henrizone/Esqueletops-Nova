@@ -39,6 +39,8 @@ export interface RemoteMediaItem {
   width?: number;
   height?: number;
   duration?: number;
+  /** Tamanho estimado (bytes) da URL principal, quando a fonte permite calcular. */
+  sizeBytes?: number;
   /** Alternativas da mesma mídia, da melhor compatível para a menor. */
   fallbackUrls?: string[];
 }

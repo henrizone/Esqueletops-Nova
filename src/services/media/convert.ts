@@ -1,4 +1,4 @@
-import { copyFile, rename, stat } from "node:fs/promises";
+import { copyFile, open, rename, stat } from "node:fs/promises";
 import { basename, dirname, extname, join, parse } from "node:path";
 import { execa } from "execa";
 import { fileTypeFromFile } from "file-type";
@@ -63,37 +63,78 @@ function normalizedPath(input: string, suffix: string, extension: string) {
   return join(parsed.dir, `${parsed.name}${suffix}${extension}`);
 }
 
+/** Limites do sendPhoto: 10 MB e largura + altura de no máximo 10000 px. */
+const TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+const TELEGRAM_PHOTO_MAX_DIMENSION_SUM = 10_000;
+
+const photoByteLimit = () => Math.min(env.MAX_UPLOAD_BYTES, TELEGRAM_PHOTO_MAX_BYTES);
+
 /**
- * Toda imagem estática termina em JPEG. A primeira etapa preserva 100% da
- * largura e altura originais; a resolução só é reduzida como último recurso
- * quando nem a compressão JPEG cabe no limite configurado do Telegram.
+ * Largura alvo para a foto caber no limite de dimensões do Telegram, ou
+ * `undefined` quando ela já cabe. Uma única imagem fora do limite fazia o
+ * Telegram recusar o álbum inteiro (PHOTO_INVALID_DIMENSIONS).
+ */
+export function photoWidthWithinTelegramLimits(width: number, height: number): number | undefined {
+  if (width <= 0 || height <= 0) return undefined;
+  if (width + height <= TELEGRAM_PHOTO_MAX_DIMENSION_SUM) return undefined;
+  const scale = (TELEGRAM_PHOTO_MAX_DIMENSION_SUM - 2) / (width + height);
+  return Math.max(1, Math.floor(width * scale));
+}
+
+/**
+ * Toda imagem estática termina em JPEG. Um JPEG que já cabe nos limites do
+ * Telegram segue intacto: recomprimir só gastava CPU e degradava a foto (o
+ * SmudgeLord também envia o arquivo original). Nos demais casos a primeira
+ * etapa preserva as dimensões; a resolução só é reduzida quando a imagem
+ * excede os limites de dimensão ou de tamanho do Telegram.
  */
 async function normalizePhoto(input: string) {
   const output = normalizedPath(input, "-telegram", TELEGRAM_PHOTO_EXTENSION);
-  const base = () => sharp(input, {
+  const limit = photoByteLimit();
+  const source = () => sharp(input, {
     animated: false,
     failOn: "none",
     limitInputPixels: false,
-  })
-    .rotate()
-    .flatten({ background: { r: 255, g: 255, b: 255 } });
+  });
 
-  for (const quality of [92, 86, 80, 74, 68, 60, 52, 44]) {
-    await base()
-      .jpeg({ quality, progressive: true, chromaSubsampling: "4:2:0" })
-      .toFile(output);
-    if (await fileSize(output) <= env.MAX_UPLOAD_BYTES) return output;
+  const metadata = await source().metadata();
+  const rotated = (metadata.orientation ?? 1) >= 5;
+  const originalWidth = (rotated ? metadata.height : metadata.width) ?? 0;
+  const originalHeight = (rotated ? metadata.width : metadata.height) ?? 0;
+  const maxWidth = photoWidthWithinTelegramLimits(originalWidth, originalHeight);
+
+  const passthrough = metadata.format === "jpeg"
+    && maxWidth === undefined
+    && (metadata.orientation ?? 1) === 1
+    && metadata.space !== "cmyk"
+    && await fileSize(input) <= limit;
+  if (passthrough) {
+    if (extname(input).toLowerCase() === TELEGRAM_PHOTO_EXTENSION) return input;
+    await copyFile(input, output);
+    return output;
   }
 
-  const metadata = await base().metadata();
-  const originalWidth = metadata.width ?? 0;
+  const base = (width?: number) => {
+    const pipeline = source()
+      .rotate()
+      .flatten({ background: { r: 255, g: 255, b: 255 } });
+    return width ? pipeline.resize({ width, fit: "inside", withoutEnlargement: true }) : pipeline;
+  };
+
+  for (const quality of [92, 86, 80, 74, 68, 60, 52, 44]) {
+    await base(maxWidth)
+      .jpeg({ quality, progressive: true, chromaSubsampling: "4:2:0" })
+      .toFile(output);
+    if (await fileSize(output) <= limit) return output;
+  }
+
+  const startWidth = maxWidth ?? originalWidth;
   for (const scale of [0.90, 0.80, 0.70, 0.60, 0.50, 0.40]) {
-    const width = originalWidth > 0 ? Math.max(1, Math.floor(originalWidth * scale)) : undefined;
-    await base()
-      .resize({ width, fit: "inside", withoutEnlargement: true })
+    const width = startWidth > 0 ? Math.max(1, Math.floor(startWidth * scale)) : undefined;
+    await base(width)
       .jpeg({ quality: 78, progressive: true, chromaSubsampling: "4:2:0" })
       .toFile(output);
-    if (await fileSize(output) <= env.MAX_UPLOAD_BYTES) return output;
+    if (await fileSize(output) <= limit) return output;
   }
 
   return output;
@@ -312,6 +353,40 @@ async function remuxVideo(input: string, dimensions: VideoDimensions, duration: 
   return { path: output, width: dimensions.width, height: dimensions.height, duration };
 }
 
+/**
+ * Um MP4 "faststart" traz o índice (moov) antes dos dados (mdat). Quando o
+ * arquivo já chega assim e no perfil do Telegram, nem o remux é necessário.
+ */
+export async function isFastStartMp4(path: string): Promise<boolean> {
+  if (extname(path).toLowerCase() !== TELEGRAM_VIDEO_EXTENSION) return false;
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const header = Buffer.alloc(16);
+    let offset = 0;
+    for (let box = 0; box < 64; box += 1) {
+      const { bytesRead } = await handle.read(header, 0, 16, offset);
+      if (bytesRead < 8) return false;
+      const type = header.toString("latin1", 4, 8);
+      if (box === 0 && type !== "ftyp") return false;
+      if (type === "moov") return true;
+      if (type === "mdat") return false;
+      let size = header.readUInt32BE(0);
+      if (size === 1) {
+        if (bytesRead < 16) return false;
+        size = Number(header.readBigUInt64BE(8));
+      }
+      if (size < 8) return false;
+      offset += size;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 async function transcodeVideo(
   input: string,
   output: string,
@@ -374,6 +449,12 @@ async function normalizeVideo(input: string): Promise<NormalizedVideo> {
 
   if (isTelegramReadyVideo(video, size)) {
     const dimensions = targetVideoDimensions(video);
+    if (await isFastStartMp4(input)) {
+      // MP4/H.264 já pronto para streaming (caso típico de Instagram, TikTok e
+      // X): enviado como veio, sem abrir o FFmpeg.
+      logger.debug({ input, mode: "passthrough" }, "Vídeo já pronto: enviado sem remux");
+      return { path: input, width: dimensions.width, height: dimensions.height, duration };
+    }
     try {
       const remuxed = await remuxVideo(input, dimensions, duration);
       logger.debug({
@@ -436,7 +517,8 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
   }
 
   let size = await fileSize(path);
-  if (size > env.MAX_UPLOAD_BYTES) {
+  const sizeLimit = kind === "photo" ? photoByteLimit() : env.MAX_UPLOAD_BYTES;
+  if (size > sizeLimit) {
     if (kind === "photo") {
       path = await normalizePhoto(path);
     } else if (kind === "video") {
@@ -458,7 +540,7 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
     size = await fileSize(path);
   }
 
-  if (size > env.MAX_UPLOAD_BYTES) {
+  if (size > sizeLimit) {
     logger.warn({ path, size }, "Arquivo continuou acima do limite após normalização");
     return undefined;
   }

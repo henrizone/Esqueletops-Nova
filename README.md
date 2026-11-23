@@ -382,7 +382,12 @@ npm test
 | `LOG_CHANNEL_ID`             |                vazio | Canal privado para logs e erros           |
 | `RUN_MODE`                   |            `polling` | Define `polling` ou `webhook`             |
 | `MAX_UPLOAD_MB`              |                 `49` | Limite utilizado antes do envio           |
-| `MAX_MEDIA_ITEMS`            |                 `10` | Máximo de itens processados por link      |
+| `MAX_MEDIA_ITEMS`            |                 `20` | Máximo de itens por publicação (álbuns de 10) |
+| `TIKTOK_HD`                  |               `true` | Usa a versão HD do TikTok como principal  |
+| `REMOTE_DOWNLOAD_CONCURRENCY` |                 `6` | Downloads simultâneos de um mesmo álbum   |
+| `INSTAGRAM_HEDGE_DELAY_MS`   |                `900` | Espera antes de acionar a próxima fonte do Instagram |
+| `TWITTER_ATTEMPT_TIMEOUT_MS` |               `8000` | Timeout por consulta ao X/Twitter         |
+| `TWITTER_MERGE_GRACE_MS`     |               `1200` | Tolerância para combinar FxTwitter e GraphQL |
 | `MAX_AUTO_DURATION_SECONDS`  |                `180` | Duração máxima no download automático     |
 | `MAX_FORCE_DURATION_SECONDS` |               `1800` | Duração máxima por comando                |
 | `DOWNLOAD_CONCURRENCY`       |                  `2` | Quantidade de downloads simultâneos       |

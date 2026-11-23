@@ -35,6 +35,9 @@ interface TikwmData {
   play?: string;
   wmplay?: string;
   hdplay?: string;
+  /** Tamanhos em bytes informados pelo tikwm. */
+  size?: number;
+  hd_size?: number;
   cover?: string;
   origin_cover?: string;
   author?: TikwmAuthor;
@@ -104,17 +107,20 @@ function remoteItemsFromData(data: TikwmData): RemoteMediaItem[] {
   // Post de fotos (carrossel de imagens).
   const images = data.image_post_info?.images ?? data.images ?? [];
   if (images.length) {
-    return images
-      .filter((url): url is string => Boolean(url))
+    return unique(images)
+      .slice(0, env.MAX_MEDIA_ITEMS)
       .map((url) => ({ url, kind: "photo" as const }));
   }
 
-  // Vídeo sem marca d'água. Preferimos `play` (qualidade padrão, JÁ pronto no
-  // tikwm = rápido) em vez de `hdplay` (HD gerado sob demanda = mais lento).
-  // O SmudgeLord também prioriza velocidade aqui. `hdplay` fica como fallback
-  // (melhor qualidade se o play falhar) e `wmplay` (com marca) como último caso.
-  const videoUrls = unique([data.play, data.hdplay, data.wmplay]);
+  // Vídeo sem marca d'água. Com TIKTOK_HD ligado a versão HD (qualidade
+  // original) é a principal e `play` (padrão) fica como alternativa caso o HD
+  // falhe ou não caiba. `wmplay` (com marca d'água) é sempre o último caso.
+  const hdFirst = env.TIKTOK_HD && Boolean(data.hdplay);
+  const videoUrls = unique(hdFirst
+    ? [data.hdplay, data.play, data.wmplay]
+    : [data.play, data.hdplay, data.wmplay]);
   if (!videoUrls.length) return [];
+  const sizeBytes = Number(hdFirst ? data.hd_size : data.size) || undefined;
 
   const [primary, ...fallbacks] = videoUrls;
   return [
@@ -123,6 +129,7 @@ function remoteItemsFromData(data: TikwmData): RemoteMediaItem[] {
       kind: "video",
       thumbnailUrl: data.origin_cover || data.cover,
       duration: data.duration,
+      sizeBytes,
       fallbackUrls: fallbacks.length ? fallbacks : undefined,
     },
   ];
@@ -131,8 +138,7 @@ function remoteItemsFromData(data: TikwmData): RemoteMediaItem[] {
 async function fetchTikwm(rawUrl: string): Promise<TikwmData> {
   const endpoint = new URL(env.TIKTOK_API_URL);
   endpoint.searchParams.set("url", rawUrl);
-  // Sem hd=1: pedir HD faz o tikwm gerar o arquivo sob demanda (lento). Como
-  // priorizamos o `play` (já pronto), a resposta vem bem mais rápido.
+  if (env.TIKTOK_HD) endpoint.searchParams.set("hd", "1");
 
   const response = await fetch(endpoint.toString(), {
     redirect: "follow",
