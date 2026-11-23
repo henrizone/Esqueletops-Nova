@@ -1,11 +1,11 @@
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { extname } from "node:path";
 import PQueue from "p-queue";
 import { claimOnce, consumeCooldown, incrementWindow } from "../../cache/redis.js";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { buildMediaCaption } from "../media/caption.js";
-import { prepareMediaFiles } from "../media/convert.js";
+import { fitVideoToSize, prepareMediaFiles } from "../media/convert.js";
 import { materializeRemoteItems } from "../media/direct.js";
 import type { PreparedMediaItem } from "../media/types.js";
 import { extractUrls, isAllowedMediaUrl, isAutoMediaUrl, isYouTubeShortsUrl, normalizeUrl } from "../media/urls.js";
@@ -37,6 +37,24 @@ const MIME_TYPES: Record<string, string> = {
   ".mp3": "audio/mpeg",
   ".m4a": "audio/mp4",
 };
+
+/**
+ * A Evolution decide como entregar pelo `mediatype`, mas mimetype genérico ou
+ * nome sem a extensão certa fazem o WhatsApp tratar a mídia como arquivo.
+ */
+function mimeTypeFor(item: PreparedMediaItem): string {
+  const known = MIME_TYPES[extname(item.path).toLowerCase()];
+  if (known) return known;
+  if (item.kind === "photo") return "image/jpeg";
+  if (item.kind === "video") return "video/mp4";
+  return "application/octet-stream";
+}
+
+function fileNameFor(item: PreparedMediaItem, index: number): string {
+  if (item.kind === "photo") return `foto-${index + 1}.jpg`;
+  if (item.kind === "video") return `video-${index + 1}.mp4`;
+  return item.filename;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Leitura do webhook                                                        */
@@ -156,11 +174,29 @@ function quotedFor(message: IncomingWhatsAppMessage): WhatsAppQuoted {
   };
 }
 
-function whatsAppMediaType(item: PreparedMediaItem): WhatsAppMediaType {
+export function whatsAppMediaType(item: Pick<PreparedMediaItem, "kind">): WhatsAppMediaType {
   if (item.kind === "photo") return "image";
-  // Vídeo acima do limite de mídia do WhatsApp só passa como documento.
-  if (item.kind === "video") return item.size > env.WHATSAPP_MAX_VIDEO_BYTES ? "document" : "video";
+  if (item.kind === "video") return "video";
+  // O sendMedia da Evolution só aceita image/video/document.
   return "document";
+}
+
+/**
+ * Vídeo sempre chega como vídeo (com player), nunca como arquivo. Quando passa
+ * do limite de mídia do WhatsApp ele é comprimido para caber; se nem assim
+ * couber (vídeo muito longo), é omitido e entra no aviso da legenda.
+ */
+async function fitForWhatsApp(item: PreparedMediaItem): Promise<PreparedMediaItem | undefined> {
+  if (item.kind !== "video") return item.size <= env.WHATSAPP_MAX_FILE_BYTES ? item : undefined;
+  if (item.size <= env.WHATSAPP_MAX_VIDEO_BYTES) return item;
+  try {
+    const fitted = await fitVideoToSize(item, env.WHATSAPP_MAX_VIDEO_BYTES);
+    if (fitted) logger.debug({ from: item.size, to: fitted.size }, "WhatsApp: vídeo comprimido para caber como mídia");
+    return fitted;
+  } catch (error) {
+    logger.warn({ error, path: item.path }, "WhatsApp: não foi possível comprimir o vídeo");
+    return undefined;
+  }
 }
 
 async function sendPrepared(message: IncomingWhatsAppMessage, items: PreparedMediaItem[], caption: string) {
@@ -170,9 +206,9 @@ async function sendPrepared(message: IncomingWhatsAppMessage, items: PreparedMed
       await sendWhatsAppMedia({
         number: message.remoteJid,
         mediatype: whatsAppMediaType(item),
-        mimetype: MIME_TYPES[extname(item.path).toLowerCase()] ?? "application/octet-stream",
+        mimetype: mimeTypeFor(item),
         media,
-        fileName: item.filename,
+        fileName: fileNameFor(item, index),
         caption: index === 0 && caption ? caption : undefined,
         delay: typingDelay(),
         quoted: index === 0 ? quotedFor(message) : undefined,
@@ -208,7 +244,8 @@ async function processLink(message: IncomingWhatsAppMessage, rawUrl: string) {
 
     const prepared: PreparedMediaItem[] = [];
     for (const item of await prepareMediaFiles(files)) {
-      if ((await stat(item.path)).size <= env.WHATSAPP_MAX_FILE_BYTES) prepared.push(item);
+      const fitted = await fitForWhatsApp(item);
+      if (fitted) prepared.push(fitted);
     }
 
     const captionHtml = buildMediaCaption(metadata, url);

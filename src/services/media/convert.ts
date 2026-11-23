@@ -210,7 +210,7 @@ export interface VideoDimensions {
  * rotação do arquivo; depois reduz apenas quando algum lado excede 1280 px.
  * Não corta, não adiciona bordas e nunca força 1:1.
  */
-export function targetVideoDimensions(stream: ProbeStream): VideoDimensions {
+export function targetVideoDimensions(stream: ProbeStream, maxEdge = TELEGRAM_VIDEO_MAX_EDGE): VideoDimensions {
   const encodedWidth = Math.max(2, stream.width ?? 2);
   const encodedHeight = Math.max(2, stream.height ?? 2);
   const sar = parseRatio(stream.sample_aspect_ratio) ?? 1;
@@ -230,8 +230,8 @@ export function targetVideoDimensions(stream: ProbeStream): VideoDimensions {
 
   const scale = Math.min(
     1,
-    TELEGRAM_VIDEO_MAX_EDGE / Math.max(displayWidth, 1),
-    TELEGRAM_VIDEO_MAX_EDGE / Math.max(displayHeight, 1),
+    maxEdge / Math.max(displayWidth, 1),
+    maxEdge / Math.max(displayHeight, 1),
   );
 
   return {
@@ -264,9 +264,9 @@ function bitrateCapForDimensions(width: number, height: number) {
  * Mantém vídeos sociais 720p próximos de 2 Mbps (um Reel de 14 s fica perto
  * de 3,5–4 MB), reduzindo automaticamente para vídeos longos caberem no limite.
  */
-export function targetVideoBitrate(width: number, height: number, duration: number) {
+export function targetVideoBitrate(width: number, height: number, duration: number, maxBytes = env.MAX_UPLOAD_BYTES) {
   const safeDuration = Math.max(1, duration);
-  const fitTotalBitrate = Math.floor((env.MAX_UPLOAD_BYTES * 8 * 0.88) / safeDuration);
+  const fitTotalBitrate = Math.floor((maxBytes * 8 * 0.88) / safeDuration);
   const fitVideoBitrate = Math.max(260_000, fitTotalBitrate - TELEGRAM_VIDEO_AUDIO_BITRATE);
   return Math.min(bitrateCapForDimensions(width, height), fitVideoBitrate);
 }
@@ -392,9 +392,10 @@ async function transcodeVideo(
   output: string,
   stream: ProbeStream,
   duration: number,
+  limits: { maxBytes?: number; maxEdge?: number } = {},
 ): Promise<NormalizedVideo> {
-  const dimensions = targetVideoDimensions(stream);
-  const videoBitrate = targetVideoBitrate(dimensions.width, dimensions.height, duration);
+  const dimensions = targetVideoDimensions(stream, limits.maxEdge);
+  const videoBitrate = targetVideoBitrate(dimensions.width, dimensions.height, duration, limits.maxBytes);
 
   await execa(env.FFMPEG_BINARY, [
     "-y",
@@ -567,6 +568,48 @@ async function prepareOneMediaFile(original: string): Promise<PreparedMediaItem 
 
   logger.debug({ path, kind, extension, size, width, height, duration }, "Mídia normalizada para o Telegram");
   return { path, kind, filename: basename(path), size, width, height, duration };
+}
+
+/**
+ * Maior borda usada ao comprimir um vídeo para caber em `maxBytes`. Com pouco
+ * bitrate disponível, manter 1080p só gera blocos: reduzir a resolução dá uma
+ * imagem mais limpa no mesmo tamanho.
+ */
+export function edgeForSizeBudget(maxBytes: number, duration: number): number {
+  const bitrate = (maxBytes * 8 * 0.88) / Math.max(1, duration) - TELEGRAM_VIDEO_AUDIO_BITRATE;
+  if (bitrate >= 3_000_000) return 1920;
+  if (bitrate >= 1_200_000) return 1280;
+  if (bitrate >= 600_000) return 854;
+  return 640;
+}
+
+/**
+ * Recodifica um vídeo já preparado para caber em `maxBytes` (ex.: limite de
+ * vídeo do WhatsApp). Devolve o item original quando ele já cabe e
+ * `undefined` quando nem a recodificação conseguiu atingir o tamanho.
+ */
+export async function fitVideoToSize(item: PreparedMediaItem, maxBytes: number): Promise<PreparedMediaItem | undefined> {
+  if (item.kind !== "video" || item.size <= maxBytes) return item;
+  const probe = await probeMedia(item.path);
+  const stream = probe.streams?.find((candidate) => candidate.codec_type === "video");
+  if (!stream) return undefined;
+  const duration = durationFromProbe(probe);
+  const output = normalizedPath(item.path, "-compact", TELEGRAM_VIDEO_EXTENSION);
+  const normalized = await transcodeVideo(item.path, output, stream, duration, {
+    maxBytes,
+    maxEdge: Math.min(TELEGRAM_VIDEO_MAX_EDGE, edgeForSizeBudget(maxBytes, duration)),
+  });
+  const size = await fileSize(normalized.path);
+  if (size > maxBytes) return undefined;
+  return {
+    ...item,
+    path: normalized.path,
+    filename: basename(normalized.path),
+    size,
+    width: normalized.width,
+    height: normalized.height,
+    duration: normalized.duration,
+  };
 }
 
 /**

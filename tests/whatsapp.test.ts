@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildWhatsAppCaption, htmlToWhatsApp, WHATSAPP_CAPTION_LIMIT } from "../src/services/whatsapp/format.js";
-import { firstSupportedUrl, parseEvolutionWebhook } from "../src/services/whatsapp/handler.js";
+import { edgeForSizeBudget, targetVideoBitrate } from "../src/services/media/convert.js";
+import { firstSupportedUrl, parseEvolutionWebhook, whatsAppMediaType } from "../src/services/whatsapp/handler.js";
 
 describe("WhatsApp: formatação", () => {
   it("converte a legenda de um tweet com quote para a marcação do WhatsApp", () => {
@@ -25,6 +26,23 @@ describe("WhatsApp: formatação", () => {
     expect(caption.length).toBeLessThanOrEqual(WHATSAPP_CAPTION_LIMIT);
     expect(caption).toContain("_+16 mídias na publicação original_");
     expect(caption.endsWith("🔗 https://x.com/a/status/1")).toBe(true);
+  });
+});
+
+describe("WhatsApp: tipo de mídia", () => {
+  it("envia vídeo como vídeo e foto como imagem, nunca como arquivo", () => {
+    expect(whatsAppMediaType({ kind: "video" })).toBe("video");
+    expect(whatsAppMediaType({ kind: "photo" })).toBe("image");
+    expect(whatsAppMediaType({ kind: "audio" })).toBe("document");
+  });
+
+  it("reduz a resolução quando o vídeo precisa caber em 16 MB", () => {
+    const limit = 16 * 1024 * 1024;
+    expect(edgeForSizeBudget(limit, 20)).toBe(1920);
+    expect(edgeForSizeBudget(limit, 75)).toBe(1280);
+    expect(edgeForSizeBudget(limit, 150)).toBe(854);
+    expect(edgeForSizeBudget(limit, 300)).toBe(640);
+    expect(targetVideoBitrate(720, 1280, 75, limit)).toBeLessThan(limit * 8 / 75);
   });
 });
 

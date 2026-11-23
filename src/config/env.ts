@@ -128,7 +128,8 @@ const schema = z.object({
   WHATSAPP_GROUPS: bool.default(true),
   // Lista opcional de chats atendidos (números ou JIDs, separados por vírgula).
   WHATSAPP_ALLOWED_CHATS: z.string().default(""),
-  // Acima disso o vídeo vai como documento; acima do limite de arquivo é omitido.
+  // Vídeo acima deste tamanho é comprimido para caber e continuar chegando
+  // como vídeo (nunca como arquivo). Demais arquivos acima do limite são omitidos.
   WHATSAPP_MAX_VIDEO_MB: z.coerce.number().min(1).max(2000).default(16),
   WHATSAPP_MAX_FILE_MB: z.coerce.number().min(1).max(2000).default(49),
   TRANSLATE_PROVIDER: z.enum(["google", "libretranslate"]).default("google"),
