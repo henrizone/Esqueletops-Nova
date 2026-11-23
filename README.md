@@ -384,6 +384,7 @@ npm test
 | `MAX_UPLOAD_MB`              |                 `49` | Limite utilizado antes do envio           |
 | `MAX_MEDIA_ITEMS`            |                 `20` | Máximo de itens por publicação (álbuns de 10) |
 | `TIKTOK_HD`                  |               `true` | Usa a versão HD do TikTok como principal  |
+| `MEDIA_ARTICLES`             |               `true` | Tweets com quote em uma única rich message (estilo SmudgeLord) |
 | `REMOTE_DOWNLOAD_CONCURRENCY` |                 `6` | Downloads simultâneos de um mesmo álbum   |
 | `INSTAGRAM_HEDGE_DELAY_MS`   |                `900` | Espera antes de acionar a próxima fonte do Instagram |
 | `TWITTER_ATTEMPT_TIMEOUT_MS` |               `8000` | Timeout por consulta ao X/Twitter         |

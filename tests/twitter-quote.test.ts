@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { BotContext } from "../src/types/context.js";
+import { renderArticle, sendRemoteArticle } from "../src/services/media/sender.js";
 import {
+  buildTwitterArticle,
   buildTwitterCaption,
   mergeTweets,
   parseFxTweet,
@@ -44,7 +47,78 @@ describe("Twitter/X quote handling", () => {
     const items = tweetRemoteItems(parseFxTweet(fxQuoteTweet));
     expect(items.map((item) => [item.kind, item.url])).toEqual([
       ["video", "https://video.twimg.com/main.mp4"],
-      ["photo", "https://pbs.twimg.com/media/quoted.jpg?name=orig"],
+      ["photo", "https://pbs.twimg.com/media/quoted.jpg?name=large"],
+    ]);
+  });
+
+  it("mantém o vídeo nos dois tweets quando o principal reposta o mesmo vídeo do citado", () => {
+    const video = { type: "video", url: "https://video.twimg.com/same.mp4" };
+    const parsed = parseFxTweet({
+      text: "olha",
+      author: { name: "A", screen_name: "a" },
+      media: { all: [video] },
+      quote: { text: "original", author: { name: "B", screen_name: "b" }, media: { all: [video] } },
+    });
+    expect(tweetRemoteItems(parsed).map((item) => item.url)).toEqual([
+      "https://video.twimg.com/same.mp4",
+      "https://video.twimg.com/same.mp4",
+    ]);
+  });
+
+  it("monta o artigo no layout do SmudgeLord, com a mídia do quote dentro da citação", () => {
+    const parts = buildTwitterArticle(parseFxTweet(fxQuoteTweet))!;
+    const { html, media } = renderArticle(parts);
+    expect(media.map((entry) => [entry.id, entry.item.kind])).toEqual([["1", "video"], ["2", "photo"]]);
+    expect(html).toContain('<p><b><a href="https://x.com/bilyeoongoyangi">xeessa</a> (<code>@bilyeoongoyangi</code>)</b></p>');
+    expect(html).toContain("260709 ICN<br/>#소희");
+    const quoteStart = html.indexOf("<blockquote>");
+    expect(html.indexOf('<video src="tg://video?id=1">')).toBeLessThan(quoteStart);
+    expect(html.indexOf('<img src="tg://photo?id=2">')).toBeGreaterThan(quoteStart);
+    expect(html.trimEnd().endsWith("</blockquote>")).toBe(true);
+  });
+
+  it("agrupa fotos seguidas em colagem e só gera artigo quando há quote", () => {
+    const { html } = renderArticle([
+      { html: "<p>x</p>\n" },
+      { media: [
+        { kind: "photo", url: "https://pbs.twimg.com/media/a.jpg" },
+        { kind: "photo", url: "https://pbs.twimg.com/media/b.jpg" },
+        { kind: "video", url: "https://video.twimg.com/c.mp4" },
+      ] },
+    ]);
+    expect(html).toContain('<tg-collage>\n<img src="tg://photo?id=1"></img>\n<img src="tg://photo?id=2"></img>\n</tg-collage>');
+    expect(html).toContain('<video src="tg://video?id=3"></video>');
+    expect(buildTwitterArticle(parseFxTweet({ text: "sem quote", author: { name: "A", screen_name: "a" } }))).toBeUndefined();
+  });
+
+  it("envia o artigo em uma rich message com botão e guarda os file_id", async () => {
+    const replyWithRichMessage = vi.fn().mockResolvedValue({
+      message_id: 1,
+      rich_message: {
+        blocks: [
+          { type: "paragraph" },
+          { type: "video", video: { file_id: "main-video" } },
+          { type: "blockquote", blocks: [{ type: "paragraph" }, { type: "photo", photo: [{ file_id: "small" }, { file_id: "quote-photo" }] }] },
+        ],
+      },
+    });
+    const ctx = { replyWithRichMessage } as unknown as BotContext;
+    const cached = await sendRemoteArticle(
+      ctx,
+      buildTwitterArticle(parseFxTweet(fxQuoteTweet))!,
+      42,
+      "https://x.com/bisdelimao/status/1",
+    );
+
+    expect(replyWithRichMessage).toHaveBeenCalledTimes(1);
+    const [richMessage, options] = replyWithRichMessage.mock.calls[0]!;
+    expect(richMessage.media).toHaveLength(2);
+    expect(richMessage.media[0].media.media).toBe("https://video.twimg.com/main.mp4");
+    expect(JSON.stringify(options.reply_markup)).toContain("Abrir no Twitter/X");
+    expect(options.reply_parameters.message_id).toBe(42);
+    expect(cached?.media).toEqual([
+      { id: "1", kind: "video", fileId: "main-video" },
+      { id: "2", kind: "photo", fileId: "quote-photo" },
     ]);
   });
 
@@ -113,7 +187,7 @@ describe("Twitter/X quote handling", () => {
     expect(items).toHaveLength(2);
     expect(items[0]).toMatchObject({
       kind: "photo",
-      url: "https://pbs.twimg.com/media/photo1.jpg?name=orig",
+      url: "https://pbs.twimg.com/media/photo1.jpg?name=large",
       fallbackUrls: ["https://pbs.twimg.com/media/photo1.jpg"],
     });
     expect(items[1]).toMatchObject({

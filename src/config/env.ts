@@ -103,6 +103,9 @@ const schema = z.object({
   MEDIA_PROGRESS_MESSAGES: bool.default(false),
   MEDIA_INCLUDE_SOURCE_LINK: bool.default(true),
   MEDIA_SOURCE_BUTTON: bool.default(true),
+  // Tweets com quote são enviados como uma única rich message (texto e mídias
+  // de cada tweet, com botão), igual ao SmudgeLord. Desligue para usar álbum.
+  MEDIA_ARTICLES: bool.default(true),
   DELETE_TEMP_FILES: bool.default(true),
   TRANSLATE_PROVIDER: z.enum(["google", "libretranslate"]).default("google"),
   LIBRETRANSLATE_URL: optional,

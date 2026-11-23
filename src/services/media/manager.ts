@@ -8,8 +8,16 @@ import { escapeHtml, truncate } from "../../utils/html.js";
 import { buildMediaCaption } from "./caption.js";
 import { prepareMediaFiles } from "./convert.js";
 import { materializeRemoteItems } from "./direct.js";
-import { PartialSendError, sendCachedMedia, sendPreparedMedia, sendRemoteMedia, sendTextPost } from "./sender.js";
-import type { CachedMediaItem, CachedMediaPayload, DownloadRequest, PreparedMediaItem, RemoteMediaItem } from "./types.js";
+import {
+  PartialSendError,
+  sendCachedArticle,
+  sendCachedMedia,
+  sendPreparedMedia,
+  sendRemoteArticle,
+  sendRemoteMedia,
+  sendTextPost,
+} from "./sender.js";
+import type { CachedArticle, CachedMediaItem, CachedMediaPayload, DownloadRequest, PreparedMediaItem, RemoteMediaItem } from "./types.js";
 import { mediaCacheKey } from "./urls.js";
 import { downloadMedia } from "./ytdlp.js";
 import { isInstagramPostUrl, isInstagramReelUrl } from "./instagram.js";
@@ -82,10 +90,16 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
 
   const key = mediaCacheKey(request.url, request.mode);
   const cached = await cacheGetJson<CachedMediaPayload>(`media:${key}`);
-  if (cached?.items.length) {
+  if (cached?.items.length || cached?.article) {
     const caption = request.captionEnabled ? buildMediaCaption(cached.metadata, request.url) : "";
     try {
-      await sendCachedMedia(ctx, cached, caption, request.replyToMessageId, request.url);
+      // O artigo carrega o texto dos tweets; com legendas desligadas no chat
+      // vai só o álbum de mídias.
+      if (cached.article && (request.captionEnabled || !cached.items.length)) {
+        await sendCachedArticle(ctx, cached.article, request.replyToMessageId, request.url);
+      } else {
+        await sendCachedMedia(ctx, cached, caption, request.replyToMessageId, request.url);
+      }
       // Antes o link original só era apagado quando a mídia NÃO vinha do cache.
       await deleteSourceMessage(ctx, request);
       logger.info({ url: request.url, durationMs: Date.now() - startedAt, cache: true }, "Mídia enviada");
@@ -112,14 +126,40 @@ export async function processDownload(ctx: BotContext, request: DownloadRequest)
     }
 
     const caption = request.captionEnabled ? buildMediaCaption(metadata, request.url) : "";
-    const store = async (items: CachedMediaItem[]) => {
-      if (!items.length) return;
+    const store = async (items: CachedMediaItem[], article?: CachedArticle) => {
+      if (!items.length && !article) return;
       await cacheSetJson(`media:${key}`, {
+        article,
         items,
         metadata,
         cachedAt: new Date().toISOString(),
       } satisfies CachedMediaPayload, env.MEDIA_CACHE_TTL_SECONDS).catch(() => undefined);
     };
+
+    // ARTIGO (estilo SmudgeLord): tweet com quote vai em uma única rich
+    // message — cada tweet com o próprio texto e as próprias mídias, mais o
+    // botão "Abrir no Twitter/X". Se o Telegram recusar, segue o fluxo de álbum.
+    if (env.MEDIA_ARTICLES && request.captionEnabled && downloaded.article?.length) {
+      try {
+        const hasVideo = downloaded.remoteItems?.some((item) => item.kind === "video");
+        await ctx.api.sendChatAction(request.chatId, hasVideo ? "upload_video" : "upload_photo").catch(() => undefined);
+        const article = await sendRemoteArticle(ctx, downloaded.article, request.replyToMessageId, request.url);
+        if (article) {
+          await store(article.media.map((entry) => ({ kind: entry.kind, fileId: entry.fileId })), article);
+        }
+        await deleteSourceMessage(ctx, request);
+        logger.info({
+          url: request.url,
+          durationMs: Date.now() - startedAt,
+          mediaCount: downloaded.remoteItems?.length ?? 0,
+          extractor: metadata.extractor,
+          article: true,
+        }, "Mídia enviada");
+        return true;
+      } catch (error) {
+        logger.warn({ error, url: request.url }, "Envio como artigo falhou; usando álbum");
+      }
+    }
 
     // Itens ainda não entregues e o que já foi enviado. O caminho rápido pode
     // falhar depois do primeiro álbum de uma publicação com mais de 10 mídias;

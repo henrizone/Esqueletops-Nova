@@ -2,7 +2,7 @@ import { cacheGetJson, cacheSetJson } from "../../cache/redis.js";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { escapeHtml, truncate } from "../../utils/html.js";
-import type { DownloadedMedia, RemoteMediaItem } from "./types.js";
+import type { DownloadedMedia, MediaArticlePart, RemoteMediaItem } from "./types.js";
 
 /* ------------------------------------------------------------------------ */
 /* Formatos de origem                                                        */
@@ -165,17 +165,20 @@ function dedupeByUrl(items: RemoteMediaItem[]): RemoteMediaItem[] {
 /* ------------------------------------------------------------------------ */
 
 /**
- * Pede a imagem no tamanho original (até 4096 px). A URL "pura" do pbs serve
- * uma versão reduzida; ela fica como alternativa caso a original seja grande
- * ou alta demais para o Telegram.
+ * Pede a imagem em `name=large` (até 2048 px). O Telegram recomprime toda
+ * foto para no máximo 2560 px, então o original de 4096 px (`name=orig`) só
+ * deixava o envio mais lento — pesa várias vezes mais e não chega maior ao
+ * chat. A URL sem parâmetro (versão menor) fica como alternativa.
  */
 function photoUrls(mediaUrl: string): string[] {
   try {
     const url = new URL(mediaUrl);
-    if (!url.hostname.endsWith("twimg.com") || url.searchParams.has("name")) return [mediaUrl];
-    const original = new URL(url);
-    original.searchParams.set("name", "orig");
-    return [original.toString(), mediaUrl];
+    if (!url.hostname.endsWith("twimg.com")) return [mediaUrl];
+    const plain = new URL(url);
+    plain.searchParams.delete("name");
+    const large = new URL(plain);
+    large.searchParams.set("name", "large");
+    return [large.toString(), plain.toString()];
   } catch {
     return [mediaUrl];
   }
@@ -351,9 +354,41 @@ export function mergeTweets(fx?: ParsedTweet, graph?: ParsedTweet): ParsedTweet 
  * Mídias enviadas: primeiro as do tweet principal e, quando o link é de um
  * quote, as do tweet citado em seguida. Cada tweet pode ter até 20 itens; o
  * envio é fatiado em álbuns de 10 pelo sender.
+ *
+ * As duas listas NÃO são deduplicadas entre si: é comum o tweet principal
+ * repostar o mesmo vídeo do tweet citado, e nesse caso o vídeo pertence aos
+ * dois (o SmudgeLord também mostra em ambos).
  */
 export function tweetRemoteItems(tweet: ParsedTweet): RemoteMediaItem[] {
-  return dedupeByUrl([...tweet.media, ...(tweet.quote?.media ?? [])]);
+  return [...tweet.media, ...(tweet.quote?.media ?? [])];
+}
+
+/** Limite folgado por tweet; a rich message inteira aceita 32768 caracteres. */
+const ARTICLE_TEXT_LIMIT = 6000;
+
+function articleTweetHtml(tweet: ParsedTweet): string {
+  const author = tweet.author;
+  const header = author
+    ? `<p><b><a href="${escapeHtml(twitterProfileUrl(author.username))}">${escapeHtml(author.name)}</a> (<code>@${escapeHtml(author.username)}</code>)</b></p>`
+    : "<p><b>X</b></p>";
+  if (!tweet.text) return `${header}\n`;
+  const text = escapeHtml(truncate(tweet.text, ARTICLE_TEXT_LIMIT)).replace(/\n/g, "<br/>");
+  return `${header}\n<p>${text}</p>\n`;
+}
+
+/**
+ * Monta o tweet com quote no mesmo layout do SmudgeLord: autor e texto do
+ * tweet principal, as mídias dele e, dentro de uma citação, o autor, o texto
+ * e as mídias do tweet citado. Tweets sem quote continuam como álbum comum.
+ */
+export function buildTwitterArticle(tweet: ParsedTweet): MediaArticlePart[] | undefined {
+  if (!tweet.quote) return undefined;
+  const parts: MediaArticlePart[] = [{ html: articleTweetHtml(tweet) }];
+  if (tweet.media.length) parts.push({ media: tweet.media });
+  parts.push({ html: `<blockquote>\n${articleTweetHtml(tweet.quote)}` });
+  if (tweet.quote.media.length) parts.push({ media: tweet.quote.media });
+  parts.push({ html: "</blockquote>\n" });
+  return parts;
 }
 
 export function buildTwitterCaption(tweet: ParsedTweet): string {
@@ -522,6 +557,7 @@ export async function downloadTwitterMedia(rawUrl: string): Promise<DownloadedMe
   return {
     files: [],
     remoteItems,
+    article: buildTwitterArticle(tweet),
     metadata: {
       id,
       uploader: tweet.author?.name,

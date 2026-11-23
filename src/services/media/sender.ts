@@ -4,8 +4,10 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import type { BotContext } from "../../types/context.js";
 import type {
+  CachedArticle,
   CachedMediaItem,
   CachedMediaPayload,
+  MediaArticlePart,
   PreparedMediaItem,
   RemoteMediaItem,
 } from "./types.js";
@@ -348,6 +350,144 @@ async function sendRemoteAlbumChunk(
     }
   }
   throw lastError ?? new Error("Não foi possível enviar o álbum remoto");
+}
+
+/* ------------------------------------------------------------------------ */
+/* Artigo (rich message)                                                     */
+/* ------------------------------------------------------------------------ */
+
+/** Máximo de mídias em uma rich message, segundo a Bot API. */
+const ARTICLE_MAX_MEDIA = 50;
+
+interface RenderedArticle {
+  html: string;
+  media: Array<{ id: string; item: RemoteMediaItem }>;
+}
+
+/**
+ * Converte os trechos do artigo no HTML da rich message. Cada mídia vira uma
+ * tag apontando para `tg://photo?id=N` / `tg://video?id=N`; duas ou mais
+ * fotos seguidas são agrupadas em uma colagem, como no SmudgeLord.
+ */
+export function renderArticle(parts: MediaArticlePart[]): RenderedArticle {
+  const media: RenderedArticle["media"] = [];
+  let html = "";
+  for (const part of parts) {
+    if ("html" in part) {
+      html += part.html;
+      continue;
+    }
+    let photoRun: string[] = [];
+    const flushPhotos = () => {
+      if (photoRun.length > 1) html += `<tg-collage>\n${photoRun.join("\n")}\n</tg-collage>\n`;
+      else if (photoRun.length === 1) html += `${photoRun[0]}\n`;
+      photoRun = [];
+    };
+    for (const item of part.media) {
+      const id = String(media.length + 1);
+      media.push({ id, item });
+      if (item.kind === "photo") {
+        photoRun.push(`<img src="tg://photo?id=${id}"></img>`);
+      } else {
+        flushPhotos();
+        html += `<video src="tg://video?id=${id}"></video>\n`;
+      }
+    }
+    flushPhotos();
+  }
+  return { html, media };
+}
+
+/** Coleta, na ordem do documento, os file_id das mídias de uma rich message enviada. */
+function articleFileIds(blocks: unknown): string[] {
+  const ids: string[] = [];
+  const walk = (list: unknown) => {
+    if (!Array.isArray(list)) return;
+    for (const block of list as Array<Record<string, any>>) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "photo" && Array.isArray(block.photo) && block.photo.length) {
+        ids.push(block.photo.at(-1).file_id);
+      } else if (block.type === "video" && block.video?.file_id) {
+        ids.push(block.video.file_id);
+      } else if (block.type === "animation" && block.animation?.file_id) {
+        ids.push(block.animation.file_id);
+      } else if (Array.isArray(block.blocks)) {
+        walk(block.blocks);
+      }
+    }
+  };
+  walk(blocks);
+  return ids;
+}
+
+function articleOptions(replyToMessageId?: number, sourceUrl?: string) {
+  return {
+    // Diferente dos álbuns, a rich message aceita teclado inline: o botão
+    // "Abrir no ..." acompanha a mensagem mesmo com várias mídias.
+    reply_markup: env.MEDIA_SOURCE_BUTTON && sourceUrl ? sourceKeyboard(sourceUrl) : undefined,
+    ...replyParams(replyToMessageId),
+  };
+}
+
+/**
+ * Envia a publicação como uma única rich message. Devolve o artigo pronto
+ * para cache (com os file_id) ou `undefined` se o Telegram não informou todos.
+ * Lança erro quando nenhuma forma de envio funcionou — o chamador então usa
+ * o álbum tradicional.
+ */
+export async function sendRemoteArticle(
+  ctx: BotContext,
+  parts: MediaArticlePart[],
+  replyToMessageId?: number,
+  sourceUrl?: string,
+): Promise<CachedArticle | undefined> {
+  const { html, media } = renderArticle(parts);
+  if (media.length > ARTICLE_MAX_MEDIA) throw new Error(`Mídias demais para uma rich message: ${media.length}`);
+
+  const plans = media.map(({ item }) => remoteSendPlans(item));
+  const maxAttempts = Math.max(1, Math.min(4, ...(plans.length ? [Math.max(...plans.map((list) => list.length))] : [1])));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const inputMedia = media.map(({ id, item }, index) => {
+        const list = plans[index]!;
+        const plan = list[Math.min(attempt, list.length - 1)]!;
+        return { id, media: remoteAlbumItem(item, plan, sourceUrl) };
+      });
+      const message = await ctx.replyWithRichMessage(
+        { html, media: inputMedia } as never,
+        articleOptions(replyToMessageId, sourceUrl),
+      );
+      const fileIds = articleFileIds((message as { rich_message?: { blocks?: unknown } }).rich_message?.blocks);
+      if (fileIds.length !== media.length) return undefined;
+      return {
+        html,
+        media: media.map(({ id, item }, index) => ({ id, kind: item.kind, fileId: fileIds[index]! })),
+      };
+    } catch (error) {
+      lastError = error;
+      logger.warn({ error, attempt: attempt + 1, url: sourceUrl }, "Falha ao enviar artigo; tentando a próxima forma de envio");
+    }
+  }
+  throw lastError ?? new Error("Não foi possível enviar o artigo");
+}
+
+export async function sendCachedArticle(
+  ctx: BotContext,
+  article: CachedArticle,
+  replyToMessageId?: number,
+  sourceUrl?: string,
+): Promise<void> {
+  const inputMedia = article.media.map((entry) => ({
+    id: entry.id,
+    media: entry.kind === "photo"
+      ? InputMediaBuilder.photo(entry.fileId)
+      : InputMediaBuilder.video(entry.fileId, { supports_streaming: true }),
+  }));
+  await ctx.replyWithRichMessage(
+    { html: article.html, media: inputMedia } as never,
+    articleOptions(replyToMessageId, sourceUrl),
+  );
 }
 
 export async function sendTextPost(
