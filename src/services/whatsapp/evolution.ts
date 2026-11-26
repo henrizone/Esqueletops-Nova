@@ -44,6 +44,13 @@ function endpoint(path: string): string {
   return `${base}/${path}/${encodeURIComponent(env.EVOLUTION_INSTANCE!)}`;
 }
 
+export class EvolutionError extends Error {
+  constructor(readonly status: number, path: string, body: string) {
+    super(`Evolution API ${path} respondeu HTTP ${status}: ${body.slice(0, 300)}`);
+    this.name = "EvolutionError";
+  }
+}
+
 async function request<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
   const response = await fetch(endpoint(path), {
     method: "POST",
@@ -55,9 +62,7 @@ async function request<T>(path: string, body: unknown, timeoutMs: number): Promi
     body: JSON.stringify(body),
   });
   const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Evolution API ${path} respondeu HTTP ${response.status}: ${text.slice(0, 300)}`);
-  }
+  if (!response.ok) throw new EvolutionError(response.status, path, text);
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -112,6 +117,34 @@ export async function sendWhatsAppSticker(input: {
   // notConvertSticker: a Evolution envia o WebP como está. Sem isso ela
   // recodifica a imagem e apaga o nome gravado na figurinha.
   await request("message/sendSticker", { ...input, notConvertSticker: true }, 90_000);
+}
+
+/**
+ * Figurinha com áudio. O formato foi observado nos apps (não é documentado
+ * pelo WhatsApp) e a Evolution oficial ainda não tem essa rota: ela existe só
+ * em builds com o patch de "sound sticker". Em um servidor sem a rota a
+ * chamada devolve 404 e o chamador envia a figurinha comum.
+ */
+export async function sendWhatsAppSoundSticker(input: {
+  number: string;
+  /** WebP pronto, em base64. */
+  sticker: string;
+  /** Ogg/Opus pronto, em base64. */
+  audio: string;
+  delay?: number;
+  quoted?: WhatsAppQuoted;
+}): Promise<void> {
+  await request("message/sendSoundSticker", {
+    ...input,
+    ptt: false,
+    encoding: false,
+    notConvertSticker: true,
+  }, 90_000);
+}
+
+/** true quando o servidor Evolution não conhece a rota (versão sem o recurso). */
+export function isUnsupportedRoute(error: unknown): boolean {
+  return error instanceof EvolutionError && (error.status === 404 || error.status === 405);
 }
 
 /**

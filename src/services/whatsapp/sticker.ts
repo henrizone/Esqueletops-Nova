@@ -34,20 +34,33 @@ export interface FigCommand {
   name: string;
   /** true quando veio com prefixo (/fig, !fig, .fig). "fig" sozinho é implícito. */
   explicit: boolean;
+  /** Figurinha com áudio: "/audio" ou "/fig audio". */
+  audio: boolean;
 }
 
 /**
- * Reconhece "/fig", "/fig nome da figurinha" e também "fig" sem barra. Sem a
- * barra a mensagem só vira comando se for exatamente "fig" ou "fig <nome>" —
- * e, mais adiante, só se houver uma imagem/vídeo para converter.
+ * Reconhece "/fig", "/fig nome da figurinha", "/audio" e "/fig audio" (com
+ * som), além de "fig" sem barra. Sem a barra a mensagem só vira comando se
+ * começar exatamente com "fig" — e, mais adiante, só se houver mídia para
+ * converter. "audio" sem barra nunca é comando: é palavra comum demais.
  */
 export function parseFigCommand(text: string): FigCommand | undefined {
-  const match = text.trim().match(/^([/!.])?(?:fig|figurinha|sticker|s)(?:\s+([\s\S]+))?$/i);
+  const trimmed = text.trim();
+  const match = trimmed.match(/^([/!.])?(fig|figurinha|sticker|s|audio|áudio)(?:\s+([\s\S]+))?$/i);
   if (!match) return undefined;
   const explicit = Boolean(match[1]);
-  // Sem prefixo só aceitamos a palavra "fig", para não capturar conversa comum.
-  if (!explicit && !/^fig(?:\s|$)/i.test(text.trim())) return undefined;
-  return { name: (match[2] ?? "").replace(/\s+/g, " ").trim(), explicit };
+  const word = match[2]!.toLowerCase();
+  if (!explicit && word !== "fig") return undefined;
+
+  let rest = (match[3] ?? "").replace(/\s+/g, " ").trim();
+  let audio = word === "audio" || word === "áudio";
+  // "/fig audio" e "/fig audio nome da figurinha".
+  const audioPrefix = rest.match(/^(?:audio|áudio)(?:\s+(.*))?$/i);
+  if (!audio && audioPrefix) {
+    audio = true;
+    rest = (audioPrefix[1] ?? "").trim();
+  }
+  return { name: rest, explicit, audio };
 }
 
 export function stickerName(requested: string, senderName?: string): string {
@@ -136,13 +149,14 @@ export function withStickerMetadata(
 /* Conversão                                                                 */
 /* ------------------------------------------------------------------------ */
 
-const TRANSPARENT = { r: 0, g: 0, b: 0, alpha: 0 };
+// Toda figurinha sai 1:1. Mídia que não é quadrada é esticada/achatada para
+// preencher os 512x512 (fit "fill"), sem bordas transparentes e sem corte.
 
 async function staticSticker(input: Buffer): Promise<Buffer> {
   for (const quality of [90, 80, 70, 60, 50, 40, 30, 20]) {
     const webp = await sharp(input, { failOn: "none", limitInputPixels: false })
       .rotate()
-      .resize({ width: STICKER_SIZE, height: STICKER_SIZE, fit: "contain", background: TRANSPARENT })
+      .resize({ width: STICKER_SIZE, height: STICKER_SIZE, fit: "fill" })
       .webp({ quality, alphaQuality: quality, effort: 5 })
       .toBuffer();
     if (webp.length <= STATIC_STICKER_MAX_BYTES - METADATA_MARGIN) return webp;
@@ -154,7 +168,7 @@ async function staticSticker(input: Buffer): Promise<Buffer> {
 async function animatedImageSticker(input: Buffer): Promise<Buffer> {
   for (const quality of [70, 55, 40, 28, 18]) {
     const webp = await sharp(input, { animated: true, failOn: "none", limitInputPixels: false })
-      .resize({ width: STICKER_SIZE, height: STICKER_SIZE, fit: "contain", background: TRANSPARENT })
+      .resize({ width: STICKER_SIZE, height: STICKER_SIZE, fit: "fill" })
       .webp({ quality, alphaQuality: quality, effort: 4, loop: 0 })
       .toBuffer();
     if (webp.length <= ANIMATED_STICKER_MAX_BYTES - METADATA_MARGIN) return webp;
@@ -181,7 +195,7 @@ async function videoSticker(input: Buffer): Promise<Buffer> {
       const seconds = Math.min(step.seconds, env.WHATSAPP_STICKER_MAX_SECONDS);
       await execa(env.FFMPEG_BINARY, [
         "-y", "-i", source, "-t", String(seconds), "-an",
-        "-vf", `fps=${step.fps},scale=${STICKER_SIZE}:${STICKER_SIZE}:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba,pad=${STICKER_SIZE}:${STICKER_SIZE}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`,
+        "-vf", `fps=${step.fps},scale=${STICKER_SIZE}:${STICKER_SIZE}:flags=lanczos,setsar=1,format=rgba`,
         "-c:v", "libwebp", "-lossless", "0", "-q:v", String(step.quality), "-compression_level", "4",
         "-preset", "default", "-loop", "0", "-fps_mode", "passthrough",
         output,
@@ -190,6 +204,38 @@ async function videoSticker(input: Buffer): Promise<Buffer> {
       if (webp.length <= ANIMATED_STICKER_MAX_BYTES - METADATA_MARGIN) return webp;
     }
     throw new Error("O vídeo não pôde ser reduzido para o limite de figurinha do WhatsApp");
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Extrai o som de um vídeo para a figurinha com áudio: Ogg/Opus mono 48 kHz,
+ * o formato das mensagens de voz do WhatsApp. Devolve `undefined` quando o
+ * vídeo não tem trilha de áudio.
+ */
+export async function extractStickerAudio(input: Buffer): Promise<Buffer | undefined> {
+  const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-wa-audio-"));
+  try {
+    const source = join(directory, "source.mp4");
+    const output = join(directory, "audio.ogg");
+    await writeFile(source, input);
+    try {
+      await execa(env.FFMPEG_BINARY, [
+        "-y", "-i", source, "-t", String(env.WHATSAPP_STICKER_MAX_SECONDS),
+        "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "48000",
+        "-c:a", "libopus", "-b:a", "48k", "-application", "voip",
+        "-f", "ogg", output,
+      ], { timeout: 60_000 });
+    } catch (error) {
+      // Sem trilha de áudio o "-map 0:a:0" falha: não é erro, só não há som.
+      if (/matches no streams|does not contain any stream/i.test(String((error as { stderr?: string }).stderr ?? error))) {
+        return undefined;
+      }
+      throw error;
+    }
+    const audio = await readFile(output);
+    return audio.length > 0 ? audio : undefined;
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }

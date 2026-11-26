@@ -22,6 +22,13 @@ import {
   WHATSAPP_WEBHOOK_PATH,
 } from "./services/whatsapp/evolution.js";
 import { handleEvolutionWebhook } from "./services/whatsapp/handler.js";
+import {
+  renderConnectionPage,
+  soundStickerConfigured,
+  soundStickerConnection,
+} from "./services/whatsapp/soundSticker.js";
+
+const SOUND_STICKER_QR_PATH = "/whatsapp/figurinhas/qr";
 
 const app = Fastify({ logger: false, bodyLimit: 20 * 1024 * 1024 });
 let ready = false;
@@ -88,6 +95,27 @@ if (whatsAppEnabled()) {
   };
   app.post(WHATSAPP_WEBHOOK_PATH, handler as never);
   app.post(`${WHATSAPP_WEBHOOK_PATH}/*`, handler as never);
+}
+
+if (whatsAppEnabled() && soundStickerConfigured()) {
+  // Página para conectar o número ao serviço de figurinhas com áudio via QR
+  // code. Protegida pelo mesmo token do webhook.
+  app.get(SOUND_STICKER_QR_PATH, async (request, reply) => {
+    if ((request.query as { token?: string } | undefined)?.token !== webhookSecret()) {
+      return reply.code(401).send({ ok: false });
+    }
+    const page = await soundStickerConnection().then(
+      (connection) => renderConnectionPage(connection),
+      (error: unknown) => {
+        logger.warn({ error }, "Serviço de figurinhas com áudio indisponível");
+        return renderConnectionPage({ error: error instanceof Error ? error.message : String(error) });
+      },
+    );
+    return reply
+      .header("content-type", "text/html; charset=utf-8")
+      .header("cache-control", "no-store")
+      .send(page);
+  });
 }
 
 async function clearPollingLock() {
@@ -241,6 +269,15 @@ async function main() {
         : "WhatsApp ativo, mas o webhook não foi registrado automaticamente"),
       (error) => logger.error({ error }, "Não foi possível registrar o webhook na Evolution API"),
     );
+  }
+
+  if (whatsAppEnabled() && soundStickerConfigured()) {
+    const publicBase = (env.SERVER_URL ?? env.WEBHOOK_URL)?.replace(/\/+$/, "") ?? `http://${env.HOST}:${env.PORT}`;
+    logger.info({
+      // O link contém o token de acesso: abra no navegador para ler o QR code.
+      pairingUrl: `${publicBase}${SOUND_STICKER_QR_PATH}?token=${webhookSecret()}`,
+      instance: env.SOUND_STICKER_INSTANCE,
+    }, "Figurinhas com áudio: serviço auxiliar configurado");
   }
 
   if (env.RUN_MODE === "webhook") {

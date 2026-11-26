@@ -128,6 +128,13 @@ const schema = z.object({
   WHATSAPP_GROUPS: bool.default(true),
   // /fig: figurinha avulsa a partir de foto, GIF ou vídeo curto.
   WHATSAPP_STICKERS: bool.default(true),
+  // Autor gravado na figurinha (aparece ao tocar nela). Vazio = sem autor.
+  WHATSAPP_STICKER_AUTHOR: z.string().default("bot de figurinhas"),
+  // Serviço auxiliar (whatsgoapi) usado só para figurinhas com áudio (/audio).
+  // Veja deploy/whatsgoapi. Sem estas variáveis o /audio envia sem som.
+  SOUND_STICKER_API_URL: optional,
+  SOUND_STICKER_API_KEY: optional,
+  SOUND_STICKER_INSTANCE: z.string().min(1).default("figurinhas"),
   WHATSAPP_STICKER_MAX_SECONDS: z.coerce.number().int().min(1).max(10).default(8),
   WHATSAPP_STICKER_MAX_INPUT_MB: z.coerce.number().min(1).max(100).default(20),
   // Lista opcional de chats atendidos (números ou JIDs, separados por vírgula).

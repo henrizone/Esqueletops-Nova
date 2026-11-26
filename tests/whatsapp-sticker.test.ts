@@ -20,15 +20,27 @@ function exifJson(webp: Buffer) {
 
 describe("/fig: comando", () => {
   it("aceita /fig com e sem nome, e outros prefixos", () => {
-    expect(parseFigCommand("/fig")).toEqual({ name: "", explicit: true });
-    expect(parseFigCommand("/fig figurinha do henry")).toEqual({ name: "figurinha do henry", explicit: true });
-    expect(parseFigCommand("  !FIG   gato   bravo ")).toEqual({ name: "gato bravo", explicit: true });
-    expect(parseFigCommand("/sticker")).toEqual({ name: "", explicit: true });
+    expect(parseFigCommand("/fig")).toEqual({ name: "", explicit: true, audio: false });
+    expect(parseFigCommand("/fig figurinha do henry")).toEqual({ name: "figurinha do henry", explicit: true, audio: false });
+    expect(parseFigCommand("  !FIG   gato   bravo ")).toEqual({ name: "gato bravo", explicit: true, audio: false });
+    expect(parseFigCommand("/sticker")).toEqual({ name: "", explicit: true, audio: false });
+  });
+
+  it("reconhece figurinha com áudio em /audio e /fig audio", () => {
+    expect(parseFigCommand("/audio")).toEqual({ name: "", explicit: true, audio: true });
+    expect(parseFigCommand("/audio risada do henry")).toEqual({ name: "risada do henry", explicit: true, audio: true });
+    expect(parseFigCommand("/fig audio")).toEqual({ name: "", explicit: true, audio: true });
+    expect(parseFigCommand("/fig áudio meme")).toEqual({ name: "meme", explicit: true, audio: true });
+    expect(parseFigCommand("fig audio")).toEqual({ name: "", explicit: false, audio: true });
+    // "audio" sem barra é conversa, não comando; "/fig audiovisual" é só um nome.
+    expect(parseFigCommand("audio")).toBeUndefined();
+    expect(parseFigCommand("audio ficou baixo")).toBeUndefined();
+    expect(parseFigCommand("/fig audiovisual")).toEqual({ name: "audiovisual", explicit: true, audio: false });
   });
 
   it("aceita 'fig' sem barra, mas não captura conversa comum", () => {
-    expect(parseFigCommand("fig")).toEqual({ name: "", explicit: false });
-    expect(parseFigCommand("Fig do henry")).toEqual({ name: "do henry", explicit: false });
+    expect(parseFigCommand("fig")).toEqual({ name: "", explicit: false, audio: false });
+    expect(parseFigCommand("Fig do henry")).toEqual({ name: "do henry", explicit: false, audio: false });
     expect(parseFigCommand("figurinha boa essa")).toBeUndefined();
     expect(parseFigCommand("sticker")).toBeUndefined();
     expect(parseFigCommand("que fig legal")).toBeUndefined();
@@ -49,7 +61,7 @@ describe("/fig: figurinha", () => {
       create: { width: 1600, height: 900, channels: 3, noise: { type: "gaussian", mean: 128, sigma: 60 } },
     }).jpeg({ quality: 95 }).toBuffer();
 
-    const sticker = await buildWhatsAppSticker(photo, "image/jpeg", { name: "figurinha do henry", author: "Esqueletops • Nova" });
+    const sticker = await buildWhatsAppSticker(photo, "image/jpeg", { name: "figurinha do henry", author: "bot de figurinhas" });
     expect(sticker.animated).toBe(false);
     expect(sticker.webp.length).toBeLessThanOrEqual(STATIC_STICKER_MAX_BYTES);
     expect(ANIMATED_STICKER_MAX_BYTES).toBe(500 * 1024);
@@ -57,12 +69,28 @@ describe("/fig: figurinha", () => {
     const metadata = await sharp(sticker.webp).metadata();
     expect(metadata.format).toBe("webp");
     expect([metadata.width, metadata.height]).toEqual([512, 512]);
-    expect(metadata.hasAlpha).toBe(true);
 
     const exif = exifJson(sticker.webp);
     expect(exif["sticker-pack-name"]).toBe("figurinha do henry");
-    expect(exif["sticker-pack-publisher"]).toBe("Esqueletops • Nova");
+    expect(exif["sticker-pack-publisher"]).toBe("bot de figurinhas");
     expect(sticker.webp.readUInt32LE(4)).toBe(sticker.webp.length - 8);
+  });
+
+  it("estica a imagem para preencher o quadrado inteiro, sem bordas", async () => {
+    // Metade esquerda vermelha, metade direita azul, em 16:9.
+    const half = { width: 800, height: 900, channels: 3 as const };
+    const wide = await sharp({ create: { width: 1600, height: 900, channels: 3, background: { r: 0, g: 0, b: 255 } } })
+      .composite([{ input: await sharp({ create: { ...half, background: { r: 255, g: 0, b: 0 } } }).png().toBuffer(), left: 0, top: 0 }])
+      .png().toBuffer();
+
+    const sticker = await buildWhatsAppSticker(wide, "image/png", { name: "x", author: "" });
+    const { data, info } = await sharp(sticker.webp).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect([info.width, info.height]).toEqual([512, 512]);
+    const pixel = (x: number, y: number) => [...data.subarray((y * info.width + x) * 4, (y * info.width + x) * 4 + 4)];
+    // Os quatro cantos têm imagem (nada de faixa transparente em cima/embaixo).
+    for (const [x, y] of [[4, 4], [507, 4], [4, 507], [507, 507]] as const) expect(pixel(x, y)[3]).toBe(255);
+    expect(pixel(4, 4)[0]).toBeGreaterThan(200);
+    expect(pixel(507, 507)[2]).toBeGreaterThan(200);
   });
 
   it("substitui metadados antigos em vez de duplicar", async () => {

@@ -12,7 +12,9 @@ import { extractUrls, isAllowedMediaUrl, isAutoMediaUrl, isYouTubeShortsUrl, nor
 import { downloadMedia } from "../media/ytdlp.js";
 import {
   fetchWhatsAppMedia,
+  isUnsupportedRoute,
   sendWhatsAppMedia,
+  sendWhatsAppSoundSticker,
   sendWhatsAppSticker,
   sendWhatsAppText,
   type WhatsAppMediaType,
@@ -20,7 +22,8 @@ import {
   type WhatsAppRawMessage,
 } from "./evolution.js";
 import { buildWhatsAppCaption, htmlToWhatsApp } from "./format.js";
-import { buildWhatsAppSticker, parseFigCommand, stickerName, type FigCommand } from "./sticker.js";
+import { sendSoundSticker, soundStickerConfigured } from "./soundSticker.js";
+import { buildWhatsAppSticker, extractStickerAudio, parseFigCommand, stickerName, type FigCommand } from "./sticker.js";
 
 /** Mensagem recebida já normalizada a partir do webhook da Evolution. */
 export interface IncomingWhatsAppMessage {
@@ -352,7 +355,13 @@ async function processLink(message: IncomingWhatsAppMessage, rawUrl: string) {
 /* /fig — figurinha avulsa (exclusivo do WhatsApp)                           */
 /* ------------------------------------------------------------------------ */
 
-const FIG_USAGE = "Envie uma foto, GIF ou vídeo curto com a legenda */fig* (ou responda a mídia com */fig*).\nPara dar nome: */fig nome da figurinha*";
+const FIG_USAGE = "Envie uma foto, GIF ou vídeo curto com a legenda */fig* (ou responda a mídia com */fig*).\nPara dar nome: */fig nome da figurinha*\nCom som (a partir de um vídeo): */audio*";
+const AUDIO_NEEDS_VIDEO = "Para figurinha com áudio, use */audio* em um vídeo com som.";
+const AUDIO_FAILED = "_Não consegui enviar o áudio agora; enviei a figurinha sem som._";
+const AUDIO_UNSUPPORTED = "_Figurinha com áudio ainda não está disponível neste bot; enviei sem som._";
+
+/** Depois do primeiro 404 não adianta insistir a cada pedido: tenta de novo só mais tarde. */
+let soundStickerUnsupportedUntil = 0;
 
 async function replyText(message: IncomingWhatsAppMessage, text: string) {
   await sendQueue.add(() => sendWhatsAppText({
@@ -376,23 +385,70 @@ async function processSticker(message: IncomingWhatsAppMessage, command: FigComm
       return;
     }
     const mimetype = source.kind === "video" ? "video/mp4" : media.mimetype;
+    const name = stickerName(command.name, message.senderName);
     const sticker = await buildWhatsAppSticker(media.buffer, mimetype, {
-      name: stickerName(command.name, message.senderName),
-      author: env.BOT_DISPLAY_NAME,
+      name,
+      author: env.WHATSAPP_STICKER_AUTHOR,
     });
+
+    let notice: string | undefined;
+    let audio: Buffer | undefined;
+    if (command.audio) {
+      if (source.kind !== "video") notice = AUDIO_NEEDS_VIDEO;
+      else if (!soundStickerConfigured() && Date.now() < soundStickerUnsupportedUntil) notice = AUDIO_UNSUPPORTED;
+      else {
+        audio = await extractStickerAudio(media.buffer).catch((error) => {
+          logger.warn({ error }, "WhatsApp: não foi possível extrair o áudio do vídeo");
+          return undefined;
+        });
+        if (!audio) notice = "_Esse vídeo não tem som; enviei a figurinha sem áudio._";
+      }
+    }
+
+    const base = {
+      number: message.remoteJid,
+      sticker: sticker.webp.toString("base64"),
+      quoted: quotedFor(message),
+    };
+    let withSound = false;
     await sendQueue.add(async () => {
-      await sendWhatsAppSticker({
-        number: message.remoteJid,
-        sticker: sticker.webp.toString("base64"),
-        delay: typingDelay(),
-        quoted: quotedFor(message),
-      });
+      if (audio && soundStickerConfigured()) {
+        // Serviço auxiliar (whatsgoapi): outro aparelho conectado no mesmo
+        // número, usado só para este envio.
+        try {
+          await sleep(typingDelay());
+          await sendSoundSticker({
+            number: message.remoteJid,
+            stickerBase64: base.sticker,
+            audioBase64: audio.toString("base64"),
+            name,
+            author: env.WHATSAPP_STICKER_AUTHOR,
+            quoted: { messageId: message.id, participant: message.sender },
+          });
+          withSound = true;
+        } catch (error) {
+          logger.warn({ error }, "WhatsApp: serviço de figurinha com áudio falhou; enviando sem som");
+          notice = AUDIO_FAILED;
+        }
+      } else if (audio) {
+        try {
+          await sendWhatsAppSoundSticker({ ...base, audio: audio.toString("base64"), delay: typingDelay() });
+          withSound = true;
+        } catch (error) {
+          if (isUnsupportedRoute(error)) soundStickerUnsupportedUntil = Date.now() + 6 * 60 * 60 * 1000;
+          logger.warn({ error }, "WhatsApp: figurinha com áudio recusada pela Evolution; enviando sem som");
+          notice = AUDIO_UNSUPPORTED;
+        }
+      }
+      if (!withSound) await sendWhatsAppSticker({ ...base, delay: typingDelay() });
       await sleep(randomBetween(env.WHATSAPP_MIN_DELAY_MS, env.WHATSAPP_MAX_DELAY_MS));
     });
+    if (notice) await replyText(message, notice);
     logger.info({
       chat: message.remoteJid,
       durationMs: Date.now() - startedAt,
       animated: sticker.animated,
+      withSound,
       bytes: sticker.webp.length,
     }, "WhatsApp: figurinha enviada");
   } catch (error) {
