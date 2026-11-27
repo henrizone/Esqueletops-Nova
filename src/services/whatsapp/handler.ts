@@ -182,6 +182,10 @@ function chatAllowed(message: IncomingWhatsAppMessage): boolean {
   return candidates.some((candidate) => env.WHATSAPP_ALLOWED_CHAT_LIST.includes(candidate.toLowerCase()));
 }
 
+const REFUSED_COOLDOWN = "cooldown do usuário";
+const REFUSED_CHAT_LIMIT = "limite por chat";
+const REFUSED_GLOBAL_LIMIT = "limite global";
+
 /**
  * Decide se a mensagem pode ser atendida. Todas as recusas são silenciosas:
  * responder "aguarde" a cada link repetido é exatamente o tipo de rajada de
@@ -194,9 +198,9 @@ async function admit(message: IncomingWhatsAppMessage): Promise<string | undefin
 
   try {
     if (!await claimOnce(`wa:msg:${message.id}`, 3600)) return "mensagem duplicada";
-    if (await consumeCooldown(`wa:user:${message.sender}`, env.WHATSAPP_USER_COOLDOWN_SECONDS) > 0) return "cooldown do usuário";
-    if (await incrementWindow(`wa:chat-hour:${message.remoteJid}`, 3600) > env.WHATSAPP_CHAT_HOURLY_LIMIT) return "limite por chat";
-    if (await incrementWindow("wa:global-hour", 3600) > env.WHATSAPP_GLOBAL_HOURLY_LIMIT) return "limite global";
+    if (await consumeCooldown(`wa:user:${message.sender}`, env.WHATSAPP_USER_COOLDOWN_SECONDS) > 0) return REFUSED_COOLDOWN;
+    if (await incrementWindow(`wa:chat-hour:${message.remoteJid}`, 3600) > env.WHATSAPP_CHAT_HOURLY_LIMIT) return REFUSED_CHAT_LIMIT;
+    if (await incrementWindow("wa:global-hour", 3600) > env.WHATSAPP_GLOBAL_HOURLY_LIMIT) return REFUSED_GLOBAL_LIMIT;
   } catch (error) {
     // Sem Redis não há como garantir os limites; melhor não responder.
     logger.warn({ error }, "Limites do WhatsApp indisponíveis; mensagem ignorada");
@@ -386,10 +390,12 @@ async function processSticker(message: IncomingWhatsAppMessage, command: FigComm
     }
     const mimetype = source.kind === "video" ? "video/mp4" : media.mimetype;
     const name = stickerName(command.name, message.senderName);
+    // Com áudio, a animação acompanha a duração do som (até o limite configurado).
+    const wantsSound = command.audio && source.kind === "video";
     const sticker = await buildWhatsAppSticker(media.buffer, mimetype, {
       name,
       author: env.WHATSAPP_STICKER_AUTHOR,
-    });
+    }, wantsSound ? { keepSeconds: env.WHATSAPP_STICKER_AUDIO_MAX_SECONDS } : {});
 
     let notice: string | undefined;
     let audio: Buffer | undefined;
@@ -397,7 +403,7 @@ async function processSticker(message: IncomingWhatsAppMessage, command: FigComm
       if (source.kind !== "video") notice = AUDIO_NEEDS_VIDEO;
       else if (!soundStickerConfigured() && Date.now() < soundStickerUnsupportedUntil) notice = AUDIO_UNSUPPORTED;
       else {
-        audio = await extractStickerAudio(media.buffer).catch((error) => {
+        audio = await extractStickerAudio(media.buffer, env.WHATSAPP_STICKER_AUDIO_MAX_SECONDS).catch((error) => {
           logger.warn({ error }, "WhatsApp: não foi possível extrair o áudio do vídeo");
           return undefined;
         });
@@ -459,6 +465,23 @@ async function processSticker(message: IncomingWhatsAppMessage, command: FigComm
 }
 
 /**
+ * Avisa quem digitou o comando com barra que ele foi segurado por um limite.
+ * No máximo um aviso por pessoa por minuto: avisar a cada tentativa seria a
+ * rajada de mensagens que os limites existem para evitar.
+ */
+async function explainRefusal(message: IncomingWhatsAppMessage, command: FigCommand, reason: string) {
+  if (!command.explicit) return;
+  const text = reason === REFUSED_COOLDOWN
+    ? `_Calma: espere ${env.WHATSAPP_USER_COOLDOWN_SECONDS} s entre um comando e outro e mande de novo._`
+    : reason === REFUSED_CHAT_LIMIT || reason === REFUSED_GLOBAL_LIMIT
+      ? "_Limite de pedidos por hora atingido. Tente de novo mais tarde._"
+      : undefined;
+  if (!text) return;
+  const first = await claimOnce(`wa:refusal-notice:${message.sender}`, 60).catch(() => false);
+  if (first) await replyText(message, text);
+}
+
+/**
  * Trata /fig. Devolve true quando a mensagem era o comando (mesmo que tenha
  * sido recusada pelos limites), para não cair no fluxo de links.
  */
@@ -472,7 +495,14 @@ async function handleFigCommand(message: IncomingWhatsAppMessage): Promise<boole
 
   const refusal = await admit(message);
   if (refusal) {
-    logger.debug({ chat: message.remoteJid, reason: refusal }, "WhatsApp: /fig não atendido");
+    // Em nível info: uma recusa silenciosa parece "o comando não funciona".
+    logger.info({
+      chat: message.remoteJid,
+      reason: refusal,
+      command: command.audio ? "audio" : "fig",
+      hasMedia: Boolean(source),
+    }, "WhatsApp: comando de figurinha não atendido");
+    await explainRefusal(message, command, refusal);
     return true;
   }
   if (!source) {
@@ -498,7 +528,7 @@ export async function handleIncomingWhatsApp(message: IncomingWhatsAppMessage): 
   if (!url) return;
   const refusal = await admit(message);
   if (refusal) {
-    logger.debug({ chat: message.remoteJid, reason: refusal }, "WhatsApp: mensagem não atendida");
+    logger.info({ chat: message.remoteJid, reason: refusal }, "WhatsApp: link não atendido");
     return;
   }
   if (workQueue.size >= env.WHATSAPP_MAX_QUEUE) {

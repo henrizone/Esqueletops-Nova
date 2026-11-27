@@ -185,14 +185,31 @@ export const VIDEO_STICKER_STEPS = [
   { seconds: 3, fps: 8, quality: 18 },
 ];
 
-async function videoSticker(input: Buffer): Promise<Buffer> {
+/**
+ * Passos para a figurinha com áudio: a duração é preservada (o som toca por
+ * todo o trecho) e quem cede primeiro são os quadros por segundo e a
+ * qualidade. Só no fim a duração é reduzida.
+ */
+export function longVideoStickerSteps(seconds: number) {
+  return [
+    { seconds, fps: 12, quality: 45 },
+    { seconds, fps: 10, quality: 32 },
+    { seconds, fps: 8, quality: 22 },
+    { seconds, fps: 6, quality: 15 },
+    { seconds: Math.min(seconds, 6), fps: 8, quality: 15 },
+    { seconds: Math.min(seconds, 4), fps: 8, quality: 15 },
+  ];
+}
+
+async function videoSticker(input: Buffer, keepSeconds?: number): Promise<Buffer> {
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-wa-sticker-"));
   try {
     const source = join(directory, "source.mp4");
     const output = join(directory, "sticker.webp");
     await writeFile(source, input);
-    for (const step of VIDEO_STICKER_STEPS) {
-      const seconds = Math.min(step.seconds, env.WHATSAPP_STICKER_MAX_SECONDS);
+    const steps = keepSeconds ? longVideoStickerSteps(keepSeconds) : VIDEO_STICKER_STEPS;
+    for (const step of steps) {
+      const seconds = keepSeconds ? step.seconds : Math.min(step.seconds, env.WHATSAPP_STICKER_MAX_SECONDS);
       await execa(env.FFMPEG_BINARY, [
         "-y", "-i", source, "-t", String(seconds), "-an",
         "-vf", `fps=${step.fps},scale=${STICKER_SIZE}:${STICKER_SIZE}:flags=lanczos,setsar=1,format=rgba`,
@@ -214,7 +231,7 @@ async function videoSticker(input: Buffer): Promise<Buffer> {
  * o formato das mensagens de voz do WhatsApp. Devolve `undefined` quando o
  * vídeo não tem trilha de áudio.
  */
-export async function extractStickerAudio(input: Buffer): Promise<Buffer | undefined> {
+export async function extractStickerAudio(input: Buffer, seconds = env.WHATSAPP_STICKER_AUDIO_MAX_SECONDS): Promise<Buffer | undefined> {
   const directory = await mkdtemp(join(tmpdir(), "esqueletops-nova-wa-audio-"));
   try {
     const source = join(directory, "source.mp4");
@@ -222,9 +239,9 @@ export async function extractStickerAudio(input: Buffer): Promise<Buffer | undef
     await writeFile(source, input);
     try {
       await execa(env.FFMPEG_BINARY, [
-        "-y", "-i", source, "-t", String(env.WHATSAPP_STICKER_MAX_SECONDS),
+        "-y", "-i", source, "-t", String(seconds),
         "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "48000",
-        "-c:a", "libopus", "-b:a", "48k", "-application", "voip",
+        "-c:a", "libopus", "-b:a", "64k", "-application", "audio",
         "-f", "ogg", output,
       ], { timeout: 60_000 });
     } catch (error) {
@@ -245,12 +262,17 @@ export async function extractStickerAudio(input: Buffer): Promise<Buffer | undef
  * Converte uma imagem, GIF/WebP animado ou vídeo em figurinha do WhatsApp
  * (WebP 512x512 dentro dos limites de tamanho) e grava o nome nela.
  */
-export async function buildWhatsAppSticker(input: Buffer, mimetype: string, info: StickerInfo): Promise<BuiltSticker> {
+export async function buildWhatsAppSticker(
+  input: Buffer,
+  mimetype: string,
+  info: StickerInfo,
+  options: { /** Figurinha com áudio: mantém esta duração (s) na animação. */ keepSeconds?: number } = {},
+): Promise<BuiltSticker> {
   const type = mimetype.toLowerCase();
   let webp: Buffer;
   let animated = false;
   if (type.startsWith("video/")) {
-    webp = await videoSticker(input);
+    webp = await videoSticker(input, options.keepSeconds);
     animated = true;
   } else {
     const metadata = await sharp(input, { animated: true, failOn: "none", limitInputPixels: false }).metadata();

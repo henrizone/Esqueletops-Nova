@@ -135,6 +135,9 @@ const schema = z.object({
   SOUND_STICKER_API_URL: optional,
   SOUND_STICKER_API_KEY: optional,
   SOUND_STICKER_INSTANCE: z.string().min(1).default("figurinhas"),
+  // Duração da figurinha COM áudio (/audio). 10 s é o limite da ferramenta
+  // oficial do WhatsApp; a animação acompanha a mesma duração.
+  WHATSAPP_STICKER_AUDIO_MAX_SECONDS: z.coerce.number().int().min(1).max(30).default(10),
   WHATSAPP_STICKER_MAX_SECONDS: z.coerce.number().int().min(1).max(10).default(8),
   WHATSAPP_STICKER_MAX_INPUT_MB: z.coerce.number().min(1).max(100).default(20),
   // Lista opcional de chats atendidos (números ou JIDs, separados por vírgula).
