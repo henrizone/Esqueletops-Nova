@@ -64,33 +64,71 @@ export interface SoundStickerConnection {
   name?: string;
 }
 
-async function status(): Promise<SoundStickerConnection> {
-  const response = await call<{ data?: { LoggedIn?: boolean; Name?: string } }>("GET", "/instance/status");
-  return { loggedIn: Boolean(response?.data?.LoggedIn), name: response?.data?.Name || undefined };
+interface InstanceStatus extends SoundStickerConnection {
+  /** true quando já existe um cliente WhatsApp rodando para a instância. */
+  running: boolean;
 }
 
+async function status(): Promise<InstanceStatus> {
+  const response = await call<{ data?: { Connected?: boolean; LoggedIn?: boolean; Name?: string } }>("GET", "/instance/status");
+  return {
+    running: Boolean(response?.data?.Connected),
+    loggedIn: Boolean(response?.data?.LoggedIn),
+    name: response?.data?.Name || undefined,
+  };
+}
+
+const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
 /**
- * Estado da conexão para a página de pareamento: garante a instância, inicia
- * o cliente e devolve o QR code enquanto o número não estiver conectado.
+ * IMPORTANTE: na whatsgoapi, tanto /instance/connect quanto /instance/qr
+ * iniciam um cliente quando ainda não há nenhum rodando. Chamar os dois em
+ * seguida (ou duas vezes ao mesmo tempo) cria DOIS clientes para a mesma
+ * instância: o usuário pareia um deles, o outro continua gerando QR codes,
+ * estoura o limite e força um logout que apaga a sessão recém-pareada.
+ *
+ * Por isso: o cliente é iniciado uma única vez (connect) e o QR só é pedido
+ * depois que o status confirma que ele está rodando.
  */
-export async function soundStickerConnection(): Promise<SoundStickerConnection> {
+async function resolveConnection(): Promise<SoundStickerConnection> {
   await ensureInstance();
-  const current = await status().catch(() => ({ loggedIn: false }) as SoundStickerConnection);
+  let current = await status();
   if (current.loggedIn) return current;
 
-  // Sem webhook: este aparelho não precisa nos avisar de nada, só enviar.
-  await call("POST", "/instance/connect", { body: { webhookUrl: "", subscribe: [] } });
-  // O QR é gerado de forma assíncrona logo após o connect.
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    try {
-      const response = await call<{ data?: { Qrcode?: string } }>("GET", "/instance/qr");
-      if (response?.data?.Qrcode) return { loggedIn: false, qrcode: response.data.Qrcode };
-    } catch (error) {
-      if (error instanceof SoundStickerError && /already logged in/i.test(error.message)) return status();
+  if (!current.running) {
+    // Sem webhook: este aparelho não precisa nos avisar de nada, só enviar.
+    await call("POST", "/instance/connect", { body: { webhookUrl: "", subscribe: [] } });
+    for (let attempt = 0; attempt < 15 && !current.running; attempt += 1) {
+      await wait(1000);
+      current = await status();
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (current.loggedIn) return current;
+    // Ainda subindo: a página tenta de novo sozinha, sem iniciar outro cliente.
+    if (!current.running) return { loggedIn: false };
+  }
+
+  try {
+    const response = await call<{ data?: { Qrcode?: string } }>("GET", "/instance/qr");
+    if (response?.data?.Qrcode) return { loggedIn: false, qrcode: response.data.Qrcode };
+  } catch (error) {
+    if (error instanceof SoundStickerError && /already logged in/i.test(error.message)) return status();
+    // "no QR code available": o código ainda não foi gerado; tenta no próximo refresh.
   }
   return { loggedIn: false };
+}
+
+let pendingConnection: Promise<SoundStickerConnection> | undefined;
+
+/**
+ * Estado da conexão para a página de pareamento. Pedidos simultâneos (duas
+ * abas, ou o refresh automático chegando antes do anterior terminar)
+ * compartilham a mesma consulta, para nunca iniciar o cliente em paralelo.
+ */
+export function soundStickerConnection(): Promise<SoundStickerConnection> {
+  pendingConnection ??= resolveConnection().finally(() => {
+    pendingConnection = undefined;
+  });
+  return pendingConnection;
 }
 
 export async function sendSoundSticker(input: {
