@@ -146,6 +146,10 @@ export async function sendSoundSticker(input: {
     timeoutMs: 120_000,
     body: {
       number: input.number,
+      // O JID já vem exato do WhatsApp (via webhook). Com a formatação ligada
+      // (padrão), a API "normaliza" números brasileiros removendo o nono
+      // dígito e o envio falha com "recipient is not on WhatsApp".
+      formatJid: false,
       sticker: input.stickerBase64,
       audio: input.audioBase64,
       pack_name: input.name,
